@@ -1,757 +1,654 @@
 'use client';
 
 import React, { useEffect, useMemo, useState } from 'react';
-import {
-  Card, CardContent, CardHeader, CardTitle,
-} from '@/components/ui/card';
+import { motion, AnimatePresence } from 'framer-motion';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { Badge } from '@/components/ui/badge';
-import { Label } from '@/components/ui/label';
 import { Progress } from '@/components/ui/progress';
-import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Checkbox } from '@/components/ui/checkbox';
+import { Label } from '@/components/ui/label';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
 import { Separator } from '@/components/ui/separator';
 import {
-  Calendar as CalendarIcon,
-  CheckCircle2,
-  ChevronDown,
-  ChevronUp,
-  Flame,
-  History,
-  ListChecks,
   Plus,
-  Trash2,
-  User,
+  Star,
+  StarOff,
+  CheckCircle2,
+  AlertCircle,
 } from 'lucide-react';
 
-/* ========= Types ========= */
+/* ========================
+   Types & Helpers
+======================== */
 type Priority = 'Low' | 'Medium' | 'High';
-type GoalStatus = 'Active' | 'Paused' | 'Completed' | 'Dropped';
-type Tried = 'Yes' | 'No' | 'Neutral';
-type TriedOrEmpty = Tried | '';
+
+interface Task {
+  title: string;
+  progress: number; // 0, 5, 50, 100
+}
+
+interface Reflection {
+  learned: string;
+  improve: string;
+  triedWell: 'Yes' | 'No' | 'Maybe';
+}
+
+interface Postpone {
+  reason: string;
+  consequences: string;
+}
+
+interface DailyEntry {
+  tasks: Task[];
+  reflection?: Reflection;
+  notDoneReasons?: string;
+  postpone?: Postpone;
+}
 
 interface Goal {
   id: string;
   title: string;
   description: string;
-  startDate: string;
-  endDate: string;
   priority: Priority;
-  status: GoalStatus;
-  progress: number;        // 0–100
-  dailyWeight?: number;    // how much a fully-complete day contributes, in % (default 5)
+  progress: number;
+  dailyEntries: Record<string, DailyEntry>;
   createdAt: string;
   updatedAt: string;
 }
 
-type PercentChoice = 0 | 5 | 20 | 50 | 100;
-
-interface Task {
-  id: string;
-  goalId: string;
-  title: string;
-  how?: string;
-  percent: PercentChoice;
-  postponed?: boolean;
-  postponeReason?: string;
-  postponeConsequence?: string;
-}
-
-interface DayPlan {
-  date: string;             // YYYY-MM-DD
-  priorities: string[];     // ordered goalIds
-  tasks: Task[];            // today’s tasks
-  locked?: boolean;         // locked when EOD submitted
-}
-
-interface DayMeta {
+interface DailyMeta {
   date: string;
-  learned?: string;
-  improve?: string;
-  triedWell?: Tried;
-  whyNotComplete?: string;  // required if any task < 100%
-  eodSubmitted?: boolean;
+  priorities: string[]; // goal ids for today's focus
 }
 
 const NAME = 'Subhanshu';
-const LS_GOALS = 'goals_v2_simple';
-const LS_PLANS = 'plans_v1';
-const LS_META  = 'daymeta_v1';
+const LS_KEY = 'goals_v1';
+const LS_META = 'goals_daymeta_v1';
 
-/* ========= Helpers ========= */
-const todayStr = () => new Date().toISOString().slice(0, 10);
-const yyyymmdd = (d: Date) => d.toISOString().slice(0, 10);
-const yesterdayStr = () => { const d = new Date(); d.setDate(d.getDate() - 1); return yyyymmdd(d); };
-const uid = () => Math.random().toString(36).slice(2, 10);
-const clamp = (n: number, min: number, max: number) => Math.min(Math.max(n, min), max);
-const fmtDateLong = () => new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'short', day: 'numeric' });
-const PCT: readonly PercentChoice[] = [0, 5, 20, 50, 100] as const;
-const isTried = (v: TriedOrEmpty): v is Tried => v === 'Yes' || v === 'No' || v === 'Neutral';
+const todayStr = (): string => new Date().toISOString().slice(0, 10);
+const yesterdayStr = (): string => {
+  const d = new Date();
+  d.setDate(d.getDate() - 1);
+  return d.toISOString().slice(0, 10);
+};
+const nowTime = (): string => {
+  const d = new Date();
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  return `${hh}:${mm}`;
+};
+const uid = (): string => Math.random().toString(36).slice(2, 10);
+const formatTodayLong = (): string =>
+  new Date().toLocaleDateString(undefined, { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
 
-/* ========= Seeds / Storage ========= */
-const seedGoals: Goal[] = [
+const calculateCumulative = (tasks: Task[]): number => {
+  if (tasks.length === 0) return 0;
+  return tasks.reduce((sum, t) => sum + t.progress, 0) / tasks.length;
+};
+
+const loadGoals = (): Goal[] => {
+  try {
+    const raw = localStorage.getItem(LS_KEY);
+    if (!raw) return sampleGoals;
+    return JSON.parse(raw) as Goal[];
+  } catch {
+    return sampleGoals;
+  }
+};
+const saveGoals = (goals: Goal[]): void => localStorage.setItem(LS_KEY, JSON.stringify(goals));
+
+const loadMeta = (): Record<string, DailyMeta> => {
+  try {
+    const raw = localStorage.getItem(LS_META);
+    if (!raw) return {};
+    return JSON.parse(raw) as Record<string, DailyMeta>;
+  } catch {
+    return {};
+  }
+};
+const saveMeta = (meta: Record<string, DailyMeta>) => localStorage.setItem(LS_META, JSON.stringify(meta));
+
+/* ========================
+   Sample Goals
+======================== */
+const sampleGoals: Goal[] = [
   {
     id: uid(),
-    title: 'Build ML model architecture',
-    description: 'From data prep to baseline to iteration.',
-    startDate: todayStr(),
-    endDate: yyyymmdd(new Date(Date.now() + 1000 * 60 * 60 * 24 * 60)),
-    priority: 'High',
-    status: 'Active',
-    progress: 10,
-    dailyWeight: 5,
+    title: 'Build ML Model Architecture',
+    description: 'Develop a machine learning model architecture from scratch.',
+    priority: 'High' as const,
+    progress: 0,
+    dailyEntries: {},
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   },
   {
     id: uid(),
-    title: 'Run consistently',
-    description: '3 sessions a week',
-    startDate: todayStr(),
-    endDate: yyyymmdd(new Date(Date.now() + 1000 * 60 * 60 * 24 * 90)),
-    priority: 'Medium',
-    status: 'Active',
-    progress: 25,
-    dailyWeight: 5,
+    title: 'Ship Personal Portfolio',
+    description: 'Rebuild and launch personal portfolio website.',
+    priority: 'Medium' as const,
+    progress: 0,
+    dailyEntries: {},
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   },
 ];
 
-const load = <T,>(key: string, fallback: T): T => {
-  try { const raw = localStorage.getItem(key); return raw ? (JSON.parse(raw) as T) : fallback; } catch { return fallback; }
-};
-const save = (key: string, value: unknown) => localStorage.setItem(key, JSON.stringify(value));
-
-/* ========= Pretty Ring (Today %) ========= */
-function Ring({ value, size = 72 }: { value: number; size?: number }) {
-  const pct = clamp(Math.round(value), 0, 100);
-  const bg = `conic-gradient(hsl(var(--primary)) ${pct}%, hsl(var(--muted-foreground)/.15) ${pct}%)`;
-  return (
-    <div className="relative inline-grid place-items-center" style={{ width: size, height: size }}>
-      <div className="rounded-full" style={{ width: size, height: size, background: bg }} />
-      <div className="absolute rounded-full bg-background" style={{ width: size - 18, height: size - 18 }} />
-      <div className="absolute text-sm font-semibold">{pct}%</div>
-    </div>
-  );
-}
-
-/* ========= Postpone dialog ========= */
-function PostponeDialog({
-  open, onOpenChange, task, onSave,
-}: {
+/* ========================
+   Add / Edit Goal Modal
+======================== */
+interface GoalModalProps {
   open: boolean;
   onOpenChange: (v: boolean) => void;
-  task: Task | null;
-  onSave: (data: { reason: string; consequence: string }) => void;
-}) {
-  const [reason, setReason] = useState('');
-  const [consequence, setConsequence] = useState('');
-  useEffect(() => { if (open) { setReason(''); setConsequence(''); } }, [open]);
+  onSave: (g: Goal) => void;
+  initial?: Goal | null;
+}
+function GoalModal({ open, onOpenChange, onSave, initial }: GoalModalProps) {
+  const [title, setTitle] = useState(initial?.title || '');
+  const [description, setDescription] = useState(initial?.description || '');
+  const [priority, setPriority] = useState<Priority>(initial?.priority || 'Medium');
+
+  const onSubmit = () => {
+    if (!title.trim()) return;
+    const now = new Date().toISOString();
+    const g: Goal = {
+      id: initial?.id || uid(),
+      title,
+      description,
+      priority,
+      progress: initial?.progress || 0,
+      dailyEntries: initial?.dailyEntries || {},
+      createdAt: initial?.createdAt || now,
+      updatedAt: now,
+    };
+    onSave(g);
+    onOpenChange(false);
+  };
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
-        <DialogHeader><DialogTitle>Postpone “{task?.title}”</DialogTitle></DialogHeader>
-        <div className="space-y-3">
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>{initial ? 'Edit Goal' : 'New Goal'}</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-4">
           <div>
-            <Label>Why are you postponing?</Label>
-            <Textarea rows={2} value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Be specific" />
+            <Label>Goal Title</Label>
+            <Input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="e.g., Build ML Model" />
           </div>
           <div>
-            <Label>What are the consequences?</Label>
-            <Textarea rows={2} value={consequence} onChange={(e) => setConsequence(e.target.value)} placeholder="Impact on timeline, scope, quality…" />
+            <Label>Description</Label>
+            <Textarea rows={3} value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Brief description of the goal." />
+          </div>
+          <div>
+            <Label>Priority</Label>
+            <Select value={priority} onValueChange={(v: Priority) => setPriority(v)}>
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="High">High</SelectItem>
+                <SelectItem value="Medium">Medium</SelectItem>
+                <SelectItem value="Low">Low</SelectItem>
+              </SelectContent>
+            </Select>
           </div>
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)}>Cancel</Button>
-          <Button onClick={() => { onSave({ reason, consequence }); onOpenChange(false); }}>
-            <CheckCircle2 className="h-4 w-4 mr-2" />Confirm postpone
-          </Button>
+          <Button onClick={onSubmit}>Save</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>
   );
 }
 
-/* ========= Catch-up (yesterday must be closed) ========= */
-function CatchUpDialog({
-  open, onClose, date, tasks, onSubmit,
-}: {
+/* ========================
+   Set Tasks Modal
+======================== */
+interface TaskSetModalProps {
   open: boolean;
-  onClose: () => void;
-  date: string;
-  tasks: Task[];
-  onSubmit: (meta: DayMeta) => void;
-}) {
-  const [learned, setLearned] = useState('');
-  const [improve, setImprove] = useState('');
-  const [triedWell, setTriedWell] = useState<TriedOrEmpty>('');
-  const [why, setWhy] = useState('');
+  onOpenChange: (v: boolean) => void;
+  onSave: (tasks: Task[]) => void;
+}
+function TaskSetModal({ open, onOpenChange, onSave }: TaskSetModalProps) {
+  const [input, setInput] = useState('');
 
-  const hasIncomplete = tasks.some((t) => t.percent < 100);
-  const canSubmit = triedWell !== '' && (!hasIncomplete || (why && why.trim().length > 0));
-
-  const triedFinal: Tried = isTried(triedWell) ? triedWell : 'Neutral';
+  const onSubmit = () => {
+    const tasks: Task[] = input.split(/[\n,]/).map(t => t.trim()).filter(Boolean).map(title => ({ title, progress: 0 }));
+    if (tasks.length === 0) return;
+    onSave(tasks);
+    onOpenChange(false);
+    setInput('');
+  };
 
   return (
-    <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
+    <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
-        <DialogHeader><DialogTitle>Close {date}</DialogTitle></DialogHeader>
-        <div className="space-y-3">
-          <div className="text-sm text-muted-foreground">Please complete yesterday before planning a new day.</div>
-          <div><Label>What did you learn?</Label><Textarea rows={2} value={learned} onChange={(e) => setLearned(e.target.value)} /></div>
-          <div><Label>What needs to improve?</Label><Textarea rows={2} value={improve} onChange={(e) => setImprove(e.target.value)} /></div>
+        <DialogHeader>
+          <DialogTitle>Set Today's Tasks</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-4">
           <div>
-            <Label>Did you try well?</Label>
-            <div className="flex gap-2 mt-1">
-              {(['Yes', 'No', 'Neutral'] as const).map((k) => (
-                <Button key={k} variant={triedWell === k ? 'default' : 'outline'} size="sm" onClick={() => setTriedWell(k)}>{k}</Button>
-              ))}
-            </div>
+            <Label>Tasks (one per line or comma-separated)</Label>
+            <Textarea
+              rows={4}
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              placeholder="e.g., Create dataset and understanding, Create model architecture by pen, Find similar research papers"
+            />
+            <p className="text-xs text-muted-foreground mt-1">You can add 1-5 tasks. Progress will start at 0%.</p>
           </div>
-          {hasIncomplete && (
-            <div>
-              <Label>Why didn’t you complete all tasks?</Label>
-              <Textarea rows={2} value={why} onChange={(e) => setWhy(e.target.value)} placeholder="e.g., underestimated scope, meetings, blocker…" />
-            </div>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange(false)}>Cancel</Button>
+          <Button onClick={onSubmit}>Set Tasks</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/* ========================
+   Reflect Modal
+======================== */
+interface ReflectModalProps {
+  open: boolean;
+  onOpenChange: (v: boolean) => void;
+  onSave: (reflection: Reflection, reasons?: string, postpone?: Postpone) => void;
+  goalId: string;
+  date: string;
+  tasks: Task[];
+  cumulative: number;
+}
+function ReflectModal({ open, onOpenChange, onSave, goalId, date, tasks, cumulative }: ReflectModalProps) {
+  const [learned, setLearned] = useState('');
+  const [improve, setImprove] = useState('');
+  const [triedWell, setTriedWell] = useState<'Yes' | 'No' | 'Maybe'>('Maybe');
+  const [showReasons, setShowReasons] = useState(cumulative < 50);
+  const [reasons, setReasons] = useState('');
+  const [postponeChecked, setPostponeChecked] = useState(false);
+  const [postReason, setPostReason] = useState('');
+  const [consequences, setConsequences] = useState('');
+
+  const isLowProgress = cumulative < 50;
+  const requireReasons = isLowProgress;
+
+  const onSubmit = () => {
+    if (requireReasons && !reasons.trim()) {
+      alert('Please provide reasons for not completing.');
+      return;
+    }
+    if (postponeChecked && (!postReason.trim() || !consequences.trim())) {
+      alert('Please fill postpone reason and consequences.');
+      return;
+    }
+    const reflection: Reflection = { learned, improve, triedWell };
+    const notDoneReasons = requireReasons ? reasons : undefined;
+    const postpone: Postpone | undefined = postponeChecked ? { reason: postReason, consequences } : undefined;
+    onSave(reflection, notDoneReasons, postpone);
+    onOpenChange(false);
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>End of Day Reflection</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-4">
+          <div className="text-center p-4 bg-muted rounded-lg">
+            <p className="text-sm font-medium">Cumulative progress for {date}: {cumulative.toFixed(1)}%</p>
+            <Progress value={cumulative} className="mt-2 mx-auto w-1/2" />
+          </div>
+          <Separator />
+          <div>
+            <Label>What I learned today</Label>
+            <Textarea rows={2} value={learned} onChange={(e) => setLearned(e.target.value)} placeholder="Key insights from today's work..." />
+          </div>
+          <div>
+            <Label>What needs to be better</Label>
+            <Textarea rows={2} value={improve} onChange={(e) => setImprove(e.target.value)} placeholder="Areas for improvement..." />
+          </div>
+          <div>
+            <Label>Did I try well today?</Label>
+            <Select value={triedWell} onValueChange={(v: 'Yes' | 'No' | 'Maybe') => setTriedWell(v)}>
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="Yes">Yes</SelectItem>
+                <SelectItem value="Maybe">Maybe</SelectItem>
+                <SelectItem value="No">No</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          {isLowProgress && (
+            <>
+              <Separator />
+              <div>
+                <Label>Why not completed more? {requireReasons && <span className="text-red-500">*</span>}</Label>
+                <Textarea rows={2} value={reasons} onChange={(e) => setReasons(e.target.value)} placeholder="Reasons for low progress..." />
+              </div>
+              <div className="flex items-center space-x-2">
+                <Checkbox id="postpone" checked={postponeChecked} onCheckedChange={(checked) => setPostponeChecked(!!checked)} />
+                <Label htmlFor="postpone">Postpone remaining tasks to tomorrow?</Label>
+              </div>
+              {postponeChecked && (
+                <>
+                  <div>
+                    <Label>Postpone reason</Label>
+                    <Textarea rows={2} value={postReason} onChange={(e) => setPostReason(e.target.value)} placeholder="Why postpone..." />
+                  </div>
+                  <div>
+                    <Label>Potential consequences</Label>
+                    <Textarea rows={2} value={consequences} onChange={(e) => setConsequences(e.target.value)} placeholder="What could go wrong if postponed..." />
+                  </div>
+                </>
+              )}
+            </>
           )}
         </div>
         <DialogFooter>
-          <Button
-            disabled={!canSubmit}
-            onClick={() => onSubmit({ date, learned, improve, triedWell: triedFinal, whyNotComplete: hasIncomplete ? why : '', eodSubmitted: true })}
-          >
-            <CheckCircle2 className="h-4 w-4 mr-2" />Close day
-          </Button>
+          <Button variant="outline" onClick={() => onOpenChange(false)}>Cancel</Button>
+          <Button onClick={onSubmit}>Complete & Save</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>
   );
 }
 
-/* ========= Main App ========= */
-export default function GoalsApp() {
-  const [goals, setGoals] = useState<Goal[]>([]);
-  const [plans, setPlans] = useState<Record<string, DayPlan>>({});
-  const [meta, setMeta]   = useState<Record<string, DayMeta>>({});
-  const [ready, setReady] = useState(false);
+/* ========================
+   Goal Card
+======================== */
+interface GoalCardProps {
+  goal: Goal;
+  isPriority: boolean;
+  onTogglePriority: (id: string) => void;
+  onSetTasks: (g: Goal) => void;
+  onUpdateTask: (index: number, progress: number) => void;
+  onReflect: (date: string) => void;
+  today: string;
+  entry?: DailyEntry;
+}
+function GoalCard({ goal, isPriority, onTogglePriority, onSetTasks, onUpdateTask, onReflect, today, entry }: GoalCardProps) {
+  const cumulative = entry ? calculateCumulative(entry.tasks) : 0;
 
-  // postpone dialog state
-  const [postTask, setPostTask] = useState<Task | null>(null);
-  const [postOpen, setPostOpen] = useState(false);
-
-  // catch-up state
-  const [catchOpen, setCatchOpen] = useState(false);
-  const [catchDate, setCatchDate] = useState<string>('');
-  const [catchTasks, setCatchTasks] = useState<Task[]>([]);
-
-  const today = todayStr();
-
-  /* ---- init ---- */
-  useEffect(() => {
-    const g = load<Goal[]>(LS_GOALS, seedGoals);
-    const p = load<Record<string, DayPlan>>(LS_PLANS, {});
-    const m = load<Record<string, DayMeta>>(LS_META, {});
-    setGoals(g);
-    setPlans(p);
-    setMeta(m);
-    setReady(true);
-  }, []);
-
-  /* ---- persistence ---- */
-  useEffect(() => { if (ready) save(LS_GOALS, goals); }, [goals, ready]);
-  useEffect(() => { if (ready) save(LS_PLANS, plans); }, [plans, ready]);
-  useEffect(() => { if (ready) save(LS_META, meta); }, [meta, ready]);
-
-  /* ---- Ensure yesterday closed before allowing edits today ---- */
-  useEffect(() => {
-    if (!ready) return;
-    const y = yesterdayStr();
-    const yPlan = plans[y];
-    const yMeta = meta[y];
-    if (yPlan && !yMeta?.eodSubmitted) {
-      setCatchDate(y);
-      setCatchTasks(yPlan.tasks || []);
-      setCatchOpen(true);
-    }
-  }, [ready, plans, meta]);
-
-  const planToday = plans[today] || { date: today, priorities: [], tasks: [] };
-  const todayTasks = planToday.tasks;
-
-  /* ========= Morning Planner ========= */
-  const addPriority = (goalId: string) => {
-    if (planToday.locked) return;
-    setPlans((prev) => {
-      const cur = prev[today] || { date: today, priorities: [], tasks: [] };
-      if (cur.priorities.includes(goalId)) return prev;
-      return { ...prev, [today]: { ...cur, priorities: [...cur.priorities, goalId] } };
-    });
-  };
-  const removePriority = (goalId: string) => {
-    if (planToday.locked) return;
-    setPlans((prev) => {
-      const cur = prev[today] || { date: today, priorities: [], tasks: [] };
-      return { ...prev, [today]: { ...cur, priorities: cur.priorities.filter((g) => g !== goalId) } };
-    });
-  };
-  const movePriority = (goalId: string, dir: 'up' | 'down') => {
-    if (planToday.locked) return;
-    setPlans((prev) => {
-      const cur = prev[today] || { date: today, priorities: [], tasks: [] };
-      const idx = cur.priorities.indexOf(goalId);
-      if (idx === -1) return prev;
-      const to = dir === 'up' ? idx - 1 : idx + 1;
-      if (to < 0 || to >= cur.priorities.length) return prev;
-      const next = [...cur.priorities];
-      [next[idx], next[to]] = [next[to], next[idx]];
-      return { ...prev, [today]: { ...cur, priorities: next } };
-    });
-  };
-
-  const addTask = (goalId: string, title: string, how?: string) => {
-    if (!title.trim() || planToday.locked) return;
-    setPlans((prev) => {
-      const cur = prev[today] || { date: today, priorities: [], tasks: [] };
-      const t: Task = { id: uid(), goalId, title: title.trim(), how, percent: 0 };
-      return { ...prev, [today]: { ...cur, tasks: [t, ...cur.tasks] } };
-    });
-  };
-  const removeTask = (taskId: string) => {
-    if (planToday.locked) return;
-    setPlans((prev) => {
-      const cur = prev[today]; if (!cur) return prev;
-      return { ...prev, [today]: { ...cur, tasks: cur.tasks.filter((t) => t.id !== taskId) } };
-    });
-  };
-
-  /* ========= Day tapping ========= */
-  const setTaskPercent = (taskId: string, v: PercentChoice) => {
-    if (planToday.locked) return;
-    setPlans((prev) => {
-      const cur = prev[today]; if (!cur) return prev;
-      return {
-        ...prev,
-        [today]: {
-          ...cur,
-          tasks: cur.tasks.map((t) => (t.id === taskId ? { ...t, percent: v } : t)),
-        },
-      };
-    });
-  };
-  const openPostpone = (t: Task) => { setPostTask(t); setPostOpen(true); };
-  const savePostpone = ({ reason, consequence }: { reason: string; consequence: string }) => {
-    if (!postTask) return;
-    setPlans((prev) => {
-      const cur = prev[today]; if (!cur) return prev;
-      return {
-        ...prev,
-        [today]: {
-          ...cur,
-          tasks: cur.tasks.map((t) =>
-            t.id === postTask.id ? { ...t, postponed: true, postponeReason: reason, postponeConsequence: consequence } : t,
-          ),
-        },
-      };
-    });
-  };
-
-  /* ========= End of Day ========= */
-  const [learned, setLearned] = useState('');
-  const [improve, setImprove] = useState('');
-  const [tried, setTried] = useState<TriedOrEmpty>('');
-  const [whyNot, setWhyNot] = useState('');
-
-  // hydrate EOD inputs if previously saved (rare)
-  useEffect(() => {
-    if (!ready) return;
-    const m = meta[today];
-    if (!m) return;
-    setLearned(m.learned || '');
-    setImprove(m.improve || '');
-    setTried(m.triedWell ?? '');
-    setWhyNot(m.whyNotComplete || '');
-  }, [ready, meta, today]);
-
-  const hasIncomplete = todayTasks.some((t) => t.percent < 100);
-  const canClose = planToday.tasks.length > 0 &&
-    tried !== '' &&
-    (!hasIncomplete || (whyNot && whyNot.trim().length > 0));
-
-  const closeDayAndUpdate = () => {
-    if (!canClose) return;
-
-    // 1) compute per-goal average completion and add weighted delta
-    const byGoal: Record<string, { sum: number; count: number }> = {};
-    for (const t of todayTasks) {
-      if (!byGoal[t.goalId]) byGoal[t.goalId] = { sum: 0, count: 0 };
-      byGoal[t.goalId].sum += t.percent;
-      byGoal[t.goalId].count += 1;
-    }
-
-    setGoals((prev) =>
-      prev.map((g) => {
-        const agg = byGoal[g.id];
-        if (!agg) return g;
-        const avg = agg.sum / (agg.count * 100); // 0..1
-        const weight = g.dailyWeight ?? 5;
-        const delta = Math.round(avg * weight);
-        const next = clamp(g.progress + delta, 0, 100);
-        return { ...g, progress: next, updatedAt: new Date().toISOString() };
-      }),
-    );
-
-    // 2) save meta & lock plan
-    const triedFinal: Tried = isTried(tried) ? tried : 'Neutral';
-    const nextMeta: DayMeta = {
-      date: today,
-      learned, improve,
-      triedWell: triedFinal,
-      whyNotComplete: hasIncomplete ? whyNot : '',
-      eodSubmitted: true,
-    };
-    setMeta((m) => ({ ...m, [today]: nextMeta }));
-    setPlans((p) => ({ ...p, [today]: { ...planToday, locked: true } }));
-
-    // 3) reset inputs for tomorrow
-    setLearned(''); setImprove(''); setTried(''); setWhyNot('');
-  };
-
-  /* ========= Stats / Widgets ========= */
-  const todayByGoal = useMemo(() => {
-    const map = new Map<string, Task[]>();
-    for (const t of todayTasks) {
-      if (!map.has(t.goalId)) map.set(t.goalId, []);
-      map.get(t.goalId)!.push(t);
-    }
-    return map;
-  }, [todayTasks]);
-
-  const priorities = (planToday.priorities.map((id) => goals.find((g) => g.id === id)).filter(Boolean) as Goal[]);
-  const nonPriorities = goals.filter((g) => !planToday.priorities.includes(g.id) && g.status === 'Active');
-
-  const dayStats = useMemo(() => {
-    const total = todayTasks.length;
-    const done = todayTasks.filter((t) => t.percent === 100).length;
-    const postponed = todayTasks.filter((t) => t.postponed).length;
-    const avg = total ? Math.round(todayTasks.reduce((s, t) => s + t.percent, 0) / total) : 0; // 0..100
-    return { total, done, postponed, avg };
-  }, [todayTasks]);
-
-  const perGoalToday = useMemo(() => {
-    return priorities.map((g) => {
-      const list = todayByGoal.get(g.id) || [];
-      const avg = list.length ? Math.round(list.reduce((s, t) => s + t.percent, 0) / list.length) : 0;
-      const delta = Math.round((avg / 100) * (g.dailyWeight ?? 5));
-      const projected = clamp(g.progress + delta, 0, 100);
-      return { goal: g, avg, delta, projected };
-    });
-  }, [priorities, todayByGoal]);
-
-  const streak = useMemo(() => {
-    let c = 0;
-    const d = new Date();
-    for (;;) {
-      const key = yyyymmdd(d);
-      const pl = plans[key];
-      const mt = meta[key];
-      if (pl?.locked && mt?.eodSubmitted) { c++; d.setDate(d.getDate() - 1); } else break;
-    }
-    return c;
-  }, [plans, meta]);
-
-  /* ========= Render ========= */
   return (
-    <div className="p-4 md:p-8 space-y-6">
-      {/* Header */}
-      <div className="flex items-center justify-between flex-wrap gap-3">
-        <div className="flex items-center gap-3">
-          <User className="h-5 w-5" />
-          <div>
-            <div className="text-xs text-muted-foreground">Good day,</div>
-            <h1 className="text-2xl font-semibold">{NAME}</h1>
+    <motion.div
+      initial={{ opacity: 0, y: 20 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.3 }}
+    >
+      <Card className="border-0 shadow-sm hover:shadow-md transition-shadow">
+        <CardHeader className="pb-3">
+          <div className="flex items-start justify-between">
+            <CardTitle className="text-lg">{goal.title}</CardTitle>
+            <Badge variant={goal.priority === 'High' ? 'default' : 'secondary'}>{goal.priority}</Badge>
           </div>
-        </div>
-        <div className="text-right">
-          <div className="text-sm text-muted-foreground flex items-center gap-2 justify-end">
-            <CalendarIcon className="h-4 w-4" />
-            <span>{fmtDateLong()} • {today}</span>
-          </div>
-          <div className="text-xs text-muted-foreground flex items-center gap-1 justify-end">
-            <Flame className="h-4 w-4 text-orange-500" /> <span>Streak: {streak}</span>
-          </div>
-        </div>
-      </div>
-
-      {/* Today Overview (widgets) */}
-      <Card>
-        <CardHeader>
-          <CardTitle>Today Overview</CardTitle>
-        </CardHeader>
-        <CardContent className="grid gap-4 md:grid-cols-4 items-center">
-          <div className="flex items-center gap-4">
-            <Ring value={dayStats.avg} />
-            <div>
-              <div className="text-sm text-muted-foreground">Today completion</div>
-              <div className="text-2xl font-semibold">{dayStats.avg}%</div>
-            </div>
-          </div>
-
-          <div className="p-3 rounded-lg border">
-            <div className="text-xs text-muted-foreground">Planned tasks</div>
-            <div className="text-xl font-semibold">{dayStats.total}</div>
-          </div>
-          <div className="p-3 rounded-lg border">
-            <div className="text-xs text-muted-foreground">Done</div>
-            <div className="text-xl font-semibold">{dayStats.done}</div>
-          </div>
-          <div className="p-3 rounded-lg border">
-            <div className="text-xs text-muted-foreground">Postponed</div>
-            <div className="text-xl font-semibold">{dayStats.postponed}</div>
-          </div>
-
-          <div className="md:col-span-4">
-            <div className="flex justify-between text-xs mb-1 text-muted-foreground">
-              <span>Day progress</span><span>{dayStats.avg}%</span>
-            </div>
-            <Progress value={dayStats.avg} />
-          </div>
-        </CardContent>
-      </Card>
-
-      {/* Goals overview (lean, long-term) */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <ListChecks className="h-5 w-5" /> Long-term goals
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="grid gap-3 md:grid-cols-2">
-          {goals.map((g) => (
-            <div key={g.id} className="p-3 rounded-lg border">
-              <div className="flex items-center justify-between">
-                <div className="font-medium">{g.title}</div>
-                <Badge variant={g.priority === 'High' ? 'default' : 'secondary'}>{g.priority}</Badge>
-              </div>
-              <div className="text-xs text-muted-foreground flex items-center gap-2 mt-1">
-                <CalendarIcon className="h-3.5 w-3.5" /> {g.startDate} → {g.endDate}
-              </div>
-              <div className="mt-2">
-                <div className="flex justify-between text-xs mb-1">
-                  <span>Overall progress</span><span>{g.progress}%</span>
-                </div>
-                <Progress value={g.progress} />
-              </div>
-            </div>
-          ))}
-        </CardContent>
-      </Card>
-
-      {/* Morning planner */}
-      <Card>
-        <CardHeader><CardTitle>Morning plan — pick goals & tasks</CardTitle></CardHeader>
-        <CardContent className="space-y-4">
-          {/* Selected priorities in order */}
           <div className="space-y-2">
-            <Label className="text-sm">Today’s priorities (top to bottom)</Label>
-            {priorities.length === 0 && <div className="text-xs text-muted-foreground">Pick from “Available goals” below.</div>}
-            <div className="space-y-2">
-              {priorities.map((g, idx) => (
-                <div key={g.id} className="flex items-center justify-between p-2 rounded-md border">
-                  <div className="flex items-center gap-2">
-                    <span className="text-xs px-2 py-0.5 rounded bg-muted">{idx + 1}</span>
-                    <span className="font-medium">{g.title}</span>
-                  </div>
-                  <div className="flex items-center gap-1">
-                    <Button variant="outline" size="icon" onClick={() => movePriority(g.id, 'up')}><ChevronUp className="h-4 w-4" /></Button>
-                    <Button variant="outline" size="icon" onClick={() => movePriority(g.id, 'down')}><ChevronDown className="h-4 w-4" /></Button>
-                    <Button variant="destructive" size="icon" onClick={() => removePriority(g.id)}><Trash2 className="h-4 w-4" /></Button>
-                  </div>
-                </div>
-              ))}
-            </div>
+            <Progress value={goal.progress} />
+            <p className="text-xs text-muted-foreground">{goal.progress}% overall</p>
           </div>
-
-          {/* Available goals */}
-          <div className="space-y-2">
-            <Label className="text-sm">Available goals</Label>
-            <div className="flex flex-wrap gap-2">
-              {nonPriorities.map((g) => (
-                <Button key={g.id} variant="outline" size="sm" onClick={() => addPriority(g.id)}>{g.title}</Button>
-              ))}
-              {nonPriorities.length === 0 && <div className="text-xs text-muted-foreground">All active goals selected.</div>}
-            </div>
-          </div>
-
-          <Separator />
-
-          {/* Add tasks per selected goal */}
-          <div className="space-y-4">
-            {priorities.map((g) => (
-              <GoalTasksEditor key={g.id} goal={g} tasks={todayByGoal.get(g.id) || []} onAdd={addTask} onRemove={removeTask} />
-            ))}
-            {priorities.length === 0 && <div className="text-xs text-muted-foreground">Select at least one goal to add tasks for today.</div>}
-          </div>
-        </CardContent>
-      </Card>
-
-      {/* Today’s tasks + tap-in (with per-goal "Today avg" bars) */}
-      <Card>
-        <CardHeader><CardTitle>Today’s tasks — tap to update %</CardTitle></CardHeader>
-        <CardContent className="space-y-6">
-          {priorities.length === 0 && <div className="text-xs text-muted-foreground">No priorities selected.</div>}
-
-          {perGoalToday.map(({ goal: g, avg }) => (
-            <div key={g.id} className="space-y-2">
-              <div className="flex items-center justify-between">
-                <div className="text-sm font-medium">{g.title}</div>
-                <div className="text-xs text-muted-foreground">Today avg: {avg}%</div>
-              </div>
-              <Progress value={avg} />
-              {(todayByGoal.get(g.id) || []).length === 0 && (
-                <div className="text-xs text-muted-foreground mb-2">No tasks added for this goal.</div>
-              )}
-              {(todayByGoal.get(g.id) || []).map((t) => (
-                <div key={t.id} className="flex items-center justify-between p-2 rounded-md border">
-                  <div className="min-w-0">
-                    <div className="font-medium truncate">{t.title}</div>
-                    {t.how ? <div className="text-xs text-muted-foreground truncate">How: {t.how}</div> : null}
-                    {t.postponed ? (
-                      <div className="text-xs text-amber-600 mt-1">
-                        Postponed: {t.postponeReason} • Consequence: {t.postponeConsequence}
+        </CardHeader>
+        <CardContent className="space-y-3">
+          {isPriority ? (
+            <>
+              {entry && entry.tasks.length > 0 ? (
+                <>
+                  <div className="space-y-2">
+                    {entry.tasks.map((task, index) => (
+                      <div key={index} className="flex items-center gap-3 p-2 bg-muted/50 rounded-md">
+                        <div className="flex-1">
+                          <p className="font-medium text-sm">{task.title}</p>
+                          <Progress value={task.progress} className="mt-1" />
+                          <p className="text-xs text-muted-foreground">{task.progress}%</p>
+                        </div>
+                        <div className="flex gap-1">
+                          {[0, 5, 50, 100].map((p) => (
+                            <Button
+                              key={p}
+                              size="sm"
+                              variant={task.progress === p ? 'default' : 'outline'}
+                              onClick={() => onUpdateTask(index, p)}
+                            >
+                              {p}%
+                            </Button>
+                          ))}
+                        </div>
                       </div>
-                    ) : null}
-                  </div>
-                  <div className="flex items-center gap-2">
-                    {PCT.map((v) => (
-                      <Button key={v} size="sm" variant={t.percent === v ? 'default' : 'outline'} onClick={() => setTaskPercent(t.id, v)}>
-                        {v}%
-                      </Button>
                     ))}
-                    <Button variant="outline" size="sm" onClick={() => openPostpone(t)}>
-                      <History className="h-4 w-4 mr-1" />Postpone
-                    </Button>
-                    <Button variant="destructive" size="icon" onClick={() => removeTask(t.id)}>
-                      <Trash2 className="h-4 w-4" />
-                    </Button>
                   </div>
-                </div>
-              ))}
-            </div>
-          ))}
-        </CardContent>
-      </Card>
-
-      {/* End of day */}
-      <Card>
-        <CardHeader><CardTitle>End of day — lock in & update progress</CardTitle></CardHeader>
-        <CardContent className="space-y-4">
-          {/* Estimated gains widget */}
-          <div className="rounded-md border p-3">
-            <div className="text-sm font-medium mb-2">If you close now</div>
-            {perGoalToday.length === 0 && <div className="text-xs text-muted-foreground">No goals selected today.</div>}
-            <div className="space-y-3">
-              {perGoalToday.map(({ goal: g, avg, delta, projected }) => (
-                <div key={g.id}>
-                  <div className="flex items-center justify-between text-xs mb-1">
-                    <span className="font-medium truncate">{g.title}</span>
-                    <span className="text-muted-foreground">+{delta}% → {projected}%</span>
+                  <div className="text-center text-sm text-muted-foreground">
+                    Cumulative: {cumulative.toFixed(0)}%
                   </div>
-                  <Progress value={projected} />
-                  <div className="text-[10px] text-muted-foreground mt-1">Today avg {avg}% × weight {g.dailyWeight ?? 5}% = +{delta}%</div>
+                </>
+              ) : (
+                <Button variant="outline" onClick={() => onSetTasks(goal)} className="w-full">
+                  <Plus className="mr-2 h-4 w-4" /> Set today's tasks
+                </Button>
+              )}
+              {!entry?.reflection ? (
+                <Button onClick={() => onReflect(today)} className="w-full">
+                  <CheckCircle2 className="mr-2 h-4 w-4" /> Reflect & Complete
+                </Button>
+              ) : (
+                <div className="text-center p-2 bg-green-50 rounded-md text-sm text-green-700">
+                  Day completed ✅
                 </div>
-              ))}
-            </div>
-          </div>
-
-          {/* Reflection inputs */}
-          <div><Label>What did you learn?</Label><Textarea rows={2} value={learned} onChange={(e) => setLearned(e.target.value)} /></div>
-          <div><Label>What needs to improve?</Label><Textarea rows={2} value={improve} onChange={(e) => setImprove(e.target.value)} /></div>
-          <div>
-            <Label>Did you try well?</Label>
-            <div className="flex gap-2 mt-1">
-              {(['Yes', 'No', 'Neutral'] as const).map((k) => (
-                <Button key={k} variant={tried === k ? 'default' : 'outline'} size="sm" onClick={() => setTried(k)}>{k}</Button>
-              ))}
-            </div>
-          </div>
-          {hasIncomplete && (
-            <div>
-              <Label>Why didn’t you complete all tasks today?</Label>
-              <Textarea rows={2} value={whyNot} onChange={(e) => setWhyNot(e.target.value)} placeholder="e.g., underestimated scope, meetings, blocker…" />
-            </div>
-          )}
-
-          <div className="flex justify-end">
-            <Button disabled={!canClose} onClick={closeDayAndUpdate}>
-              <CheckCircle2 className="h-4 w-4 mr-2" />Close day & update goals
+              )}
+              <Button variant="ghost" size="sm" onClick={() => onTogglePriority(goal.id)} className="w-full">
+                <StarOff className="mr-2 h-4 w-4" /> Remove from today
+              </Button>
+            </>
+          ) : (
+            <Button variant="outline" onClick={() => onTogglePriority(goal.id)} className="w-full">
+              <Star className="mr-2 h-4 w-4" /> Focus today
             </Button>
-          </div>
+          )}
         </CardContent>
       </Card>
-
-      {/* dialogs */}
-      <PostponeDialog open={postOpen} onOpenChange={setPostOpen} task={postTask} onSave={savePostpone} />
-      <CatchUpDialog
-        open={catchOpen}
-        onClose={() => setCatchOpen(false)}
-        date={catchDate}
-        tasks={catchTasks}
-        onSubmit={(m) => {
-          setMeta((x) => ({ ...x, [catchDate]: m }));
-          setPlans((p) => ({ ...p, [catchDate]: { ...(p[catchDate] || { date: catchDate, priorities: [], tasks: [] }), locked: true } }));
-          setCatchOpen(false);
-        }}
-      />
-    </div>
+    </motion.div>
   );
 }
 
-/* ========= Subcomponent: per-goal task editor ========= */
-function GoalTasksEditor({
-  goal, tasks, onAdd, onRemove,
-}: {
-  goal: Goal;
-  tasks: Task[];
-  onAdd: (goalId: string, title: string, how?: string) => void;
-  onRemove: (taskId: string) => void;
-}) {
-  const [title, setTitle] = useState('');
-  const [how, setHow] = useState('');
+/* ========================
+   Main App
+======================== */
+export default function GoalsApp() {
+  const [goals, setGoals] = useState<Goal[]>([]);
+  const [metaByDay, setMetaByDay] = useState<Record<string, DailyMeta>>({});
+  const [modalOpen, setModalOpen] = useState(false);
+  const [editing, setEditing] = useState<Goal | null>(null);
+  const [taskOpen, setTaskOpen] = useState(false);
+  const [taskGoalId, setTaskGoalId] = useState('');
+  const [taskDate, setTaskDate] = useState('');
+  const [reflectOpen, setReflectOpen] = useState(false);
+  const [reflectGoalId, setReflectGoalId] = useState('');
+  const [reflectDate, setReflectDate] = useState('');
 
-  const add = () => {
-    if (!title.trim()) return;
-    onAdd(goal.id, title.trim(), how.trim() || undefined);
-    setTitle(''); setHow('');
+  const today = todayStr();
+  const todayMeta = metaByDay[today] || { date: today, priorities: [] };
+
+  useEffect(() => {
+    setGoals(loadGoals());
+    setMetaByDay(loadMeta());
+  }, []);
+  useEffect(() => saveGoals(goals), [goals]);
+  useEffect(() => saveMeta(metaByDay), [metaByDay]);
+
+  const addOrUpdateGoal = (goal: Goal) => {
+    setGoals((prev) => {
+      const exists = prev.find((g) => g.id === goal.id);
+      if (exists) {
+        return prev.map((g) => (g.id === goal.id ? goal : g));
+      }
+      return [...prev, goal];
+    });
   };
 
+  const updateGoal = (updated: Partial<Goal> & { id: string }) => {
+    setGoals((prev) => prev.map((g) => (g.id === updated.id ? { ...g, ...updated, updatedAt: new Date().toISOString() } : g)));
+  };
+
+  const deleteGoal = (id: string) => setGoals((prev) => prev.filter((g) => g.id !== id));
+
+  const togglePriority = (goalId: string) => {
+    const nextPriorities = todayMeta.priorities.includes(goalId)
+      ? todayMeta.priorities.filter((p) => p !== goalId)
+      : [...todayMeta.priorities, goalId].slice(0, 3); // Limit to 3
+    setMetaByDay((prev) => ({ ...prev, [today]: { ...todayMeta, priorities: nextPriorities } }));
+  };
+
+  const handleSetTasksClick = (goal: Goal) => {
+    const yest = yesterdayStr();
+    const yestEntry = goal.dailyEntries[yest];
+    if (yestEntry && !yestEntry.reflection) {
+      // Block: Open reflect for yesterday
+      setReflectGoalId(goal.id);
+      setReflectDate(yest);
+      setReflectOpen(true);
+      return;
+    }
+    // Proceed to set tasks for today
+    setTaskGoalId(goal.id);
+    setTaskDate(today);
+    setTaskOpen(true);
+  };
+
+  const handleSetTasksSave = (tasks: Task[]) => {
+    const goal = goals.find((g) => g.id === taskGoalId);
+    if (!goal) return;
+    updateGoal({
+      id: goal.id,
+      dailyEntries: { ...goal.dailyEntries, [taskDate]: { tasks, reflection: undefined } },
+    });
+  };
+
+  const handleUpdateTask = (index: number, progress: number) => {
+    const goal = goals.find((g) => g.id === reflectGoalId || g.id === taskGoalId); // Use current open goal
+    if (!goal || !todayMeta.priorities.includes(goal.id)) return;
+    const entry = goal.dailyEntries[today];
+    if (!entry) return;
+    const newTasks = [...entry.tasks];
+    newTasks[index].progress = progress;
+    updateGoal({
+      id: goal.id,
+      dailyEntries: { ...goal.dailyEntries, [today]: { ...entry, tasks: newTasks } },
+    });
+  };
+
+  const handleReflectClick = (date: string) => {
+    setReflectDate(date);
+    setReflectOpen(true);
+  };
+
+  const handleReflectSave = (reflection: Reflection, reasons?: string, postpone?: Postpone) => {
+    const goal = goals.find((g) => g.id === reflectGoalId);
+    if (!goal) return;
+    const entry = goal.dailyEntries[reflectDate];
+    if (!entry) return;
+    const cumulative = calculateCumulative(entry.tasks);
+    const newProgress = Math.min(100, goal.progress + cumulative);
+    updateGoal({
+      id: goal.id,
+      progress: newProgress,
+      dailyEntries: {
+        ...goal.dailyEntries,
+        [reflectDate]: {
+          ...entry,
+          reflection,
+          notDoneReasons: reasons,
+          postpone,
+        },
+      },
+    });
+  };
+
+  const visibleGoals = useMemo(() => {
+    return goals
+      .filter((g) => g.progress < 100) // Show incomplete goals
+      .sort((a, b) => {
+        const prioA = todayMeta.priorities.includes(a.id) ? -1 : { High: 0, Medium: 1, Low: 2 }[a.priority];
+        const prioB = todayMeta.priorities.includes(b.id) ? -1 : { High: 0, Medium: 1, Low: 2 }[b.priority];
+        return prioA - prioB;
+      });
+  }, [goals, todayMeta.priorities]);
+
+  const todayPrioritiesTitles = todayMeta.priorities
+    .map((id) => goals.find((g) => g.id === id)?.title)
+    .filter(Boolean)
+    .join(', ');
+
   return (
-    <div className="p-3 rounded-md border">
-      <div className="flex items-center justify-between mb-2">
-        <div className="font-medium">{goal.title}</div>
-        <div className="text-xs text-muted-foreground">Daily weight: {goal.dailyWeight ?? 5}%</div>
-      </div>
-      <div className="flex items-center gap-2">
-        <Input placeholder="Task (tiny and clear)" value={title} onChange={(e) => setTitle(e.target.value)} />
-        <Input placeholder="How? (optional)" value={how} onChange={(e) => setHow(e.target.value)} />
-        <Button onClick={add}><Plus className="h-4 w-4 mr-1" />Add</Button>
-      </div>
-      {tasks.length > 0 && (
-        <div className="mt-3 space-y-2">
-          {tasks.map((t) => (
-            <div key={t.id} className="flex items-center justify-between p-2 rounded-md border">
-              <div className="min-w-0">
-                <div className="font-medium truncate">{t.title}</div>
-                {t.how ? <div className="text-xs text-muted-foreground truncate">How: {t.how}</div> : null}
-              </div>
-              <Button variant="destructive" size="icon" onClick={() => onRemove(t.id)}>
-                <Trash2 className="h-4 w-4" />
-              </Button>
-            </div>
-          ))}
+    <div className="min-h-screen bg-background">
+      {/* Header */}
+      <header className="p-4 border-b bg-gradient-to-r from-primary/5 to-secondary/5">
+        <div className="max-w-4xl mx-auto">
+          <h1 className="text-2xl font-bold text-foreground">Good morning, {NAME}!</h1>
+          <p className="text-muted-foreground mt-1">{formatTodayLong()}</p>
+          {todayPrioritiesTitles && (
+            <p className="text-sm text-muted-foreground mt-2">Today's focus: {todayPrioritiesTitles}</p>
+          )}
+          <div className="mt-4 flex gap-2">
+            <Button onClick={() => { setEditing(null); setModalOpen(true); }}>
+              <Plus className="mr-2 h-4 w-4" /> New Goal
+            </Button>
+          </div>
         </div>
-      )}
+      </header>
+
+      {/* Goals */}
+      <main className="p-4 max-w-4xl mx-auto">
+        <AnimatePresence>
+          {visibleGoals.length > 0 ? (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              {visibleGoals.map((goal) => {
+                const entry = goal.dailyEntries[today];
+                const isPriority = todayMeta.priorities.includes(goal.id);
+                return (
+                  <GoalCard
+                    key={goal.id}
+                    goal={goal}
+                    isPriority={isPriority}
+                    onTogglePriority={togglePriority}
+                    onSetTasks={handleSetTasksClick}
+                    onUpdateTask={handleUpdateTask}
+                    onReflect={handleReflectClick}
+                    today={today}
+                    entry={entry}
+                  />
+                );
+              })}
+            </div>
+          ) : (
+            <Card className="text-center py-12">
+              <CardTitle className="text-lg mb-2">No Goals Yet</CardTitle>
+              <p className="text-muted-foreground mb-4">Start by creating your first long-term goal.</p>
+              <Button onClick={() => { setEditing(null); setModalOpen(true); }}>
+                <Plus className="mr-2 h-4 w-4" /> Create Goal
+              </Button>
+            </Card>
+          )}
+        </AnimatePresence>
+      </main>
+
+      {/* Modals */}
+      <GoalModal open={modalOpen} onOpenChange={setModalOpen} onSave={addOrUpdateGoal} initial={editing} />
+      <TaskSetModal open={taskOpen} onOpenChange={setTaskOpen} onSave={handleSetTasksSave} />
+      <ReflectModal
+        open={reflectOpen}
+        onOpenChange={setReflectOpen}
+        onSave={handleReflectSave}
+        goalId={reflectGoalId}
+        date={reflectDate}
+        tasks={(goals.find((g) => g.id === reflectGoalId)?.dailyEntries[reflectDate]?.tasks || [])}
+        cumulative={calculateCumulative(goals.find((g) => g.id === reflectGoalId)?.dailyEntries[reflectDate]?.tasks || [])}
+      />
     </div>
   );
 }
