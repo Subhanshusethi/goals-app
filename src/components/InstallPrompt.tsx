@@ -1,19 +1,28 @@
 'use client';
 import { useEffect, useState } from 'react';
 
-export default function InstallPrompt(){
-  const [deferred, setDeferred] = useState<any>(null);
+// Minimal type for the (not yet standard) `beforeinstallprompt` event
+type BeforeInstallPromptEvent = Event & {
+  prompt: () => Promise<void>;
+  userChoice: Promise<{ outcome: 'accepted' | 'dismissed'; platform: string }>;
+};
+
+export default function InstallPrompt() {
+  const [deferred, setDeferred] = useState<BeforeInstallPromptEvent | null>(null);
   const [visible, setVisible] = useState(false);
 
   useEffect(() => {
-    const onPrompt = (e: any) => {
-      e.preventDefault();
-      setDeferred(e);
+    const onPrompt = (e: Event) => {
+      const evt = e as BeforeInstallPromptEvent;
+      // prevent auto prompt so we can show our own button
+      evt.preventDefault?.();
+      setDeferred(evt);
       setVisible(true);
     };
-    // @ts-ignore
-    window.addEventListener('beforeinstallprompt', onPrompt);
-    return () => window.removeEventListener('beforeinstallprompt', onPrompt);
+
+    // The event name is correct; casting the listener keeps TS happy
+    window.addEventListener('beforeinstallprompt', onPrompt as EventListener);
+    return () => window.removeEventListener('beforeinstallprompt', onPrompt as EventListener);
   }, []);
 
   if (!visible) return null;
@@ -21,10 +30,10 @@ export default function InstallPrompt(){
   return (
     <button
       onClick={async () => {
-        const choice = await deferred.prompt();
+        if (!deferred) return;
+        await deferred.prompt();
         setVisible(false);
         setDeferred(null);
-        console.log('install choice', choice);
       }}
       className="px-3 py-2 rounded-xl border"
     >
@@ -32,4 +41,3 @@ export default function InstallPrompt(){
     </button>
   );
 }
-

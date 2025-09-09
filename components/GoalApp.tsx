@@ -635,7 +635,8 @@ const streakCount = (goals) => {
   // streak across ALL goals: how many consecutive days with any log
   const dates = new Set();
   goals.forEach(g => g.dailyLogs.forEach(l => dates.add(l.date)));
-  let streak = 0; let d = new Date();
+  let streak = 0;
+  const d = new Date(); 
   for (;;) {
     const key = d.toISOString().slice(0,10);
     if (dates.has(key)) { streak++; d.setDate(d.getDate()-1); } else break;
