@@ -89,6 +89,57 @@ const step = (n: number, delta = 5) => clamp(Math.round((n + delta) / 5) * 5, 0,
 const fmtDateLong = () => new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'short', day: 'numeric' });
 const isTried = (v: TriedOrEmpty): v is Tried => v === 'Yes' || v === 'No' || v === 'Neutral';
 
+/** Inclusive days left: 9→11 = 3, if past due returns 0 */
+const daysLeftInclusive = (fromISO: string, toISO: string): number => {
+  const from = new Date(fromISO + 'T00:00:00');
+  const to = new Date(toISO + 'T00:00:00');
+  const diff = Math.floor((to.getTime() - from.getTime()) / (1000 * 60 * 60 * 24));
+  return diff < 0 ? 0 : diff + 1;
+};
+
+/** Positive days overdue if after target */
+const daysOverdue = (fromISO: string, toISO: string): number => {
+  const from = new Date(fromISO + 'T00:00:00');
+  const to = new Date(toISO + 'T00:00:00');
+  const diff = Math.floor((from.getTime() - to.getTime()) / (1000 * 60 * 60 * 24));
+  return diff > 0 ? diff : 0;
+};
+
+/** Goal history: average of per-day averages for this goal over last N closed days (default 7). Falls back to 70 if no history. */
+const typicalDailyAvgForGoal = (goalId: string, plans: Record<string, DayPlan>, lookbackDays = 7): number => {
+  const samples: number[] = [];
+  for (let i = 1; i <= lookbackDays; i++) {
+    const d = new Date();
+    d.setDate(d.getDate() - i);
+    const key = yyyymmdd(d);
+    const p = plans[key];
+    if (!p || !p.tasks?.length) continue;
+    const tasks = p.tasks.filter(t => t.goalId === goalId);
+    if (!tasks.length) continue;
+    const avg = Math.round(tasks.reduce((s, t) => s + t.percent, 0) / tasks.length);
+    samples.push(avg);
+  }
+  if (samples.length === 0) return 70;
+  return Math.round(samples.reduce((s, v) => s + v, 0) / samples.length);
+};
+
+/** With current weight: what daily average % is needed to hit the date? */
+const requiredAvgWithCurrentWeight = (remainingPct: number, daysLeft: number, weight: number): number => {
+  if (remainingPct <= 0) return 0;
+  if (daysLeft <= 0 || weight <= 0) return 100;
+  const needed = Math.ceil((remainingPct / (daysLeft * weight)) * 100);
+  return clamp(needed, 0, 100);
+};
+
+/** If user typically averages `expectedAvgPct` per day, what daily weight should they set to hit the date? */
+const suggestedWeightToHit = (remainingPct: number, daysLeft: number, expectedAvgPct: number): number => {
+  if (remainingPct <= 0) return 5;
+  const eff = expectedAvgPct / 100;
+  if (daysLeft <= 0 || eff <= 0) return 5;
+  const w = Math.ceil(remainingPct / (daysLeft * eff));
+  return clamp(w, 1, 100);
+};
+
 /* ========= Seeds / Storage ========= */
 const seedGoals: Goal[] = [
   {
@@ -300,6 +351,8 @@ export default function GoalsApp() {
   /* ========= Goal CRUD ========= */
   const addGoal = (g: Goal) => setGoals(prev => [g, ...prev]);
   const removeGoal = (id: string) => setGoals(prev => prev.filter(x=>x.id!==id));
+  const updateGoalWeight = (id: string, w: number) =>
+    setGoals(prev => prev.map(g => g.id === id ? { ...g, dailyWeight: clamp(Math.round(w), 1, 100), updatedAt: new Date().toISOString() } : g));
 
   /* ========= Morning Planner ========= */
   const addPriority = (goalId: string) => {
@@ -361,31 +414,29 @@ export default function GoalsApp() {
       };
     });
   };
+
   // Week helpers: ISO week starting Monday
-const startOfWeek = (isoDate: string) => {
-  const d = new Date(isoDate + 'T00:00:00');
-  // make Monday=0 … Sunday=6
-  const weekday = (d.getDay() + 6) % 7;
-  d.setDate(d.getDate() - weekday);
-  return yyyymmdd(d);
-};
-
-const endOfWeek = (isoDate: string) => {
-  const s = new Date(startOfWeek(isoDate) + 'T00:00:00');
-  s.setDate(s.getDate() + 6);
-  return yyyymmdd(s);
-};
-
-const dateRange = (start: string, end: string) => {
-  const out: string[] = [];
-  const d = new Date(start + 'T00:00:00');
-  const e = new Date(end + 'T00:00:00');
-  while (d <= e) {
-    out.push(yyyymmdd(d));
-    d.setDate(d.getDate() + 1);
-  }
-  return out;
-};
+  const startOfWeek = (isoDate: string) => {
+    const d = new Date(isoDate + 'T00:00:00');
+    const weekday = (d.getDay() + 6) % 7; // Mon=0…Sun=6
+    d.setDate(d.getDate() - weekday);
+    return yyyymmdd(d);
+  };
+  const endOfWeek = (isoDate: string) => {
+    const s = new Date(startOfWeek(isoDate) + 'T00:00:00');
+    s.setDate(s.getDate() + 6);
+    return yyyymmdd(s);
+  };
+  const dateRange = (start: string, end: string) => {
+    const out: string[] = [];
+    const d = new Date(start + 'T00:00:00');
+    const e = new Date(end + 'T00:00:00');
+    while (d <= e) {
+      out.push(yyyymmdd(d));
+      d.setDate(d.getDate() + 1);
+    }
+    return out;
+  };
 
   const setQuick = (taskId: string, v: number) => {
     if (planToday.locked) return;
@@ -452,7 +503,6 @@ const dateRange = (start: string, end: string) => {
     if (incomplete.length) {
       setPlans(prev => {
         const tPlan = prev[tomorrow] || { date: tomorrow, priorities: [], tasks: [] };
-        // ensure priorities include the goals of postponed tasks (keep order from today if possible)
         const addGoals = Array.from(new Set(incomplete.map(t => t.goalId)));
         const mergedPriorities = [...tPlan.priorities];
         for (const gid of addGoals) if (!mergedPriorities.includes(gid)) mergedPriorities.push(gid);
@@ -462,7 +512,7 @@ const dateRange = (start: string, end: string) => {
         return {
           ...prev,
           [tomorrow]: { ...tPlan, priorities: mergedPriorities, tasks: [...moved, ...tPlan.tasks] },
-          [today]: { ...(prev[today] || planToday), locked: true }, // lock today
+          [today]: { ...(prev[today] || planToday), locked: true },
         };
       });
     } else {
@@ -498,61 +548,59 @@ const dateRange = (start: string, end: string) => {
   const nonPriorities = goals.filter((g) => !planToday.priorities.includes(g.id) && g.status === 'Active');
 
   // --- Weekly goal-centric progress (Mon–Sun of the current week) ---
-const weekStats = useMemo(() => {
-  const start = startOfWeek(today);
-  const end = endOfWeek(today);
-  const days = dateRange(start, end);
+  const weekStats = useMemo(() => {
+    const start = startOfWeek(today);
+    const end = endOfWeek(today);
+    const days = dateRange(start, end);
 
-  let actual = 0; // sum of deltas applied across all goals/days
-  let max = 0;    // sum of dailyWeight for goals that had tasks that day
+    let actual = 0; // sum of deltas applied across all goals/days
+    let max = 0;    // sum of dailyWeight for goals that had tasks that day
 
-  // aggregate per-goal for the week (for mini bars)
-  const perGoalAgg = new Map<string, { title: string; actual: number; max: number }>();
+    // aggregate per-goal for the week (for mini bars)
+    const perGoalAgg = new Map<string, { title: string; actual: number; max: number }>();
 
-  for (const day of days) {
-    const dayPlan = plans[day];
-    if (!dayPlan || dayPlan.tasks.length === 0) continue;
+    for (const day of days) {
+      const dayPlan = plans[day];
+      if (!dayPlan || dayPlan.tasks.length === 0) continue;
 
-    // group tasks by goal for that day
-    const byGoal = new Map<string, Task[]>();
-    for (const t of dayPlan.tasks) {
-      const arr = byGoal.get(t.goalId) || [];
-      arr.push(t);
-      byGoal.set(t.goalId, arr);
+      // group tasks by goal for that day
+      const byGoal = new Map<string, Task[]>();
+      for (const t of dayPlan.tasks) {
+        const arr = byGoal.get(t.goalId) || [];
+        arr.push(t);
+        byGoal.set(t.goalId, arr);
+      }
+
+      // compute delta per goal for that day
+      byGoal.forEach((list, gid) => {
+        const g = goals.find((x) => x.id === gid);
+        const weight = g?.dailyWeight ?? 5;
+        const avg = Math.round(list.reduce((s, t) => s + t.percent, 0) / list.length); // 0..100
+        const delta = Math.round((avg / 100) * { value: weight }.value); // keep TS happy with number narrowing
+        actual += delta;
+        max += weight;
+
+        const current = perGoalAgg.get(gid) || { title: g?.title ?? 'Unknown goal', actual: 0, max: 0 };
+        current.actual += delta;
+        current.max += weight;
+        perGoalAgg.set(gid, current);
+      });
     }
 
-    // compute delta per goal for that day
-    byGoal.forEach((list, gid) => {
-      const g = goals.find((x) => x.id === gid);
-      const weight = g?.dailyWeight ?? 5;
-      const avg = Math.round(list.reduce((s, t) => s + t.percent, 0) / list.length); // 0..100
-      const delta = Math.round((avg / 100) * weight); // integer points
+    const percent = max ? Math.round((actual / max) * 100) : 0;
 
-      actual += delta;
-      max += weight;
+    const perGoal = Array.from(perGoalAgg.entries())
+      .map(([id, v]) => ({
+        id,
+        title: v.title,
+        percent: v.max ? Math.round((v.actual / v.max) * 100) : 0,
+        actual: v.actual,
+        max: v.max,
+      }))
+      .sort((a, b) => b.actual - a.actual);
 
-      const current = perGoalAgg.get(gid) || { title: g?.title ?? 'Unknown goal', actual: 0, max: 0 };
-      current.actual += delta;
-      current.max += weight;
-      perGoalAgg.set(gid, current);
-    });
-  }
-
-  const percent = max ? Math.round((actual / max) * 100) : 0;
-
-  const perGoal = Array.from(perGoalAgg.entries())
-    .map(([id, v]) => ({
-      id,
-      title: v.title,
-      percent: v.max ? Math.round((v.actual / v.max) * 100) : 0,
-      actual: v.actual,
-      max: v.max,
-    }))
-    .sort((a, b) => b.actual - a.actual);
-
-  return { start, end, actual, max, percent, perGoal };
-}, [plans, goals, today]);
-
+    return { start, end, actual, max, percent, perGoal };
+  }, [plans, goals, today]);
 
   const dayStats = useMemo(() => {
     const total = todayTasks.length;
@@ -647,6 +695,7 @@ const weekStats = useMemo(() => {
           </div>
         </CardContent>
       </Card>
+
       {/* This Week (Goal-centric) */}
       <Card>
         <CardHeader>
@@ -669,7 +718,6 @@ const weekStats = useMemo(() => {
                 </div>
               </div>
             </div>
-            {/* quick stats */}
             <div className="p-3 rounded-lg border md:col-span-3">
               <div className="text-xs text-muted-foreground mb-2">Per-goal momentum this week</div>
               {weekStats.perGoal.length === 0 && (
@@ -693,8 +741,7 @@ const weekStats = useMemo(() => {
         </CardContent>
       </Card>
 
-
-      {/* Long-term goals */}
+      {/* Long-term goals (with Deadline Helper) */}
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
@@ -702,27 +749,83 @@ const weekStats = useMemo(() => {
           </CardTitle>
         </CardHeader>
         <CardContent className="grid gap-3 md:grid-cols-2">
-          {goals.map((g) => (
-            <div key={g.id} className="p-3 rounded-lg border">
-              <div className="flex items-center justify-between">
-                <div className="font-medium">{g.title}</div>
-                <Badge variant={g.priority === 'High' ? 'default' : 'secondary'}>{g.priority}</Badge>
-              </div>
-              <div className="text-xs text-muted-foreground mt-1">{g.note}</div>
-              <div className="text-xs text-muted-foreground flex items-center gap-2 mt-1">
-                <CalendarIcon className="h-3.5 w-3.5" /> {g.startDate} → {g.targetDate}
-              </div>
-              <div className="mt-2">
-                <div className="flex justify-between text-xs mb-1">
-                  <span>Overall progress</span><span>{g.progress}%</span>
+          {goals.map((g) => {
+            const daysLeft = daysLeftInclusive(today, g.targetDate);
+            const overdue = daysOverdue(today, g.targetDate);
+            const remaining = clamp(100 - g.progress, 0, 100);
+            const weight = g.dailyWeight ?? 5;
+            const reqAvg = requiredAvgWithCurrentWeight(remaining, daysLeft, weight);
+            const typical = typicalDailyAvgForGoal(g.id, plans);
+            const suggestedW = suggestedWeightToHit(remaining, daysLeft, typical);
+            const impossibleWithCurrent = daysLeft > 0 && reqAvg > 100;
+
+            return (
+              <div key={g.id} className="p-3 rounded-lg border">
+                <div className="flex items-center justify-between">
+                  <div className="font-medium">{g.title}</div>
+                  <Badge variant={g.priority === 'High' ? 'default' : 'secondary'}>{g.priority}</Badge>
                 </div>
-                <Progress value={g.progress} />
+                <div className="text-xs text-muted-foreground mt-1">{g.note}</div>
+                <div className="text-xs text-muted-foreground flex items-center gap-2 mt-1">
+                  <CalendarIcon className="h-3.5 w-3.5" /> {g.startDate} → {g.targetDate}
+                </div>
+
+                <div className="mt-2">
+                  <div className="flex justify-between text-xs mb-1">
+                    <span>Overall progress</span><span>{g.progress}%</span>
+                  </div>
+                  <Progress value={g.progress} />
+                </div>
+
+                {/* Deadline helper */}
+                <div className="mt-3 p-2 rounded-md border">
+                  {remaining <= 0 ? (
+                    <div className="text-xs text-muted-foreground">Goal completed 🎉</div>
+                  ) : overdue > 0 ? (
+                    <div className="text-xs text-red-500">Past deadline by {overdue} day{overdue>1?'s':''}. Remaining {remaining}%.</div>
+                  ) : (
+                    <>
+                      <div className="text-xs flex flex-wrap gap-2">
+                        <span className="font-medium">Finish by target:</span>
+                        <span>{daysLeft} day{daysLeft>1?'s':''} left</span>
+                        <span>• Remaining {remaining}%</span>
+                        <span>• Weight {weight}%/day</span>
+                      </div>
+                      <div className="text-xs mt-1">
+                        Daily avg needed with current weight: <span className="font-medium">{reqAvg}%</span>
+                        {impossibleWithCurrent && <span className="text-red-500"> (100%/day still not enough)</span>}
+                      </div>
+                      <div className="text-xs mt-1">
+                        Based on your recent days (avg ~{typical}%), try weight&nbsp;
+                        <span className="font-medium">{suggestedW}%</span>
+                        &nbsp;<Button size="sm" className="ml-2" onClick={()=>updateGoalWeight(g.id, suggestedW)}>Apply</Button>
+                      </div>
+                    </>
+                  )}
+                </div>
+
+                <div className="mt-2 flex justify-end gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={()=> updateGoalWeight(g.id, Math.max(1, (g.dailyWeight ?? 5) - 5))}
+                  >
+                    -5% weight
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={()=> updateGoalWeight(g.id, Math.min(100, (g.dailyWeight ?? 5) + 5))}
+                  >
+                    +5% weight
+                  </Button>
+                  <Button variant="destructive" size="sm" onClick={()=>removeGoal(g.id)}>
+                    <Trash2 className="h-4 w-4 mr-1" />Remove
+                  </Button>
+                </div>
               </div>
-              <div className="mt-2 flex justify-end">
-                <Button variant="destructive" size="sm" onClick={()=>removeGoal(g.id)}><Trash2 className="h-4 w-4 mr-1" />Remove</Button>
-              </div>
-            </div>
-          ))}
+            );
+          })}
           {goals.length === 0 && <div className="text-xs text-muted-foreground">No goals yet—add one above.</div>}
         </CardContent>
       </Card>
@@ -760,10 +863,10 @@ const weekStats = useMemo(() => {
           <div className="space-y-2">
             <Label className="text-sm">Available goals</Label>
             <div className="flex flex-wrap gap-2">
-              {goals.filter(g=>!planToday.priorities.includes(g.id) && g.status==='Active').map((g) => (
+              {nonPriorities.map((g) => (
                 <Button key={g.id} variant="outline" size="sm" onClick={() => addPriority(g.id)}>{g.title}</Button>
               ))}
-              {goals.filter(g=>!planToday.priorities.includes(g.id) && g.status==='Active').length === 0 && (
+              {nonPriorities.length === 0 && (
                 <div className="text-xs text-muted-foreground">All active goals selected.</div>
               )}
             </div>
@@ -776,6 +879,12 @@ const weekStats = useMemo(() => {
             {planToday.priorities.map((gid) => {
               const g = goals.find(x=>x.id===gid);
               if (!g) return null;
+
+              // Tiny hint: today's required avg with current weight
+              const daysLeft = daysLeftInclusive(today, g.targetDate);
+              const remaining = clamp(100 - g.progress, 0, 100);
+              const reqAvgToday = requiredAvgWithCurrentWeight(remaining, daysLeft, g.dailyWeight ?? 5);
+
               return (
                 <GoalTasksEditor
                   key={gid}
@@ -783,6 +892,7 @@ const weekStats = useMemo(() => {
                   tasks={(plans[today]?.tasks || []).filter(t=>t.goalId===gid)}
                   onAdd={addTask}
                   onRemove={removeTask}
+                  dailyHint={`Target today ≈ ${reqAvgToday}% avg to stay on track`}
                 />
               );
             })}
@@ -817,7 +927,6 @@ const weekStats = useMemo(() => {
                       <Button variant="outline" size="icon" onClick={()=>incTask(t.id, -5)} aria-label="decrease"><Minus className="h-4 w-4" /></Button>
                       <div className="w-14 text-center text-sm font-medium">{t.percent}%</div>
                       <Button variant="outline" size="icon" onClick={()=>incTask(t.id, +5)} aria-label="increase"><Plus className="h-4 w-4" /></Button>
-                      {/* quick jumps */}
                       {[0,25,50,100].map(v=>(
                         <Button key={v} variant={t.percent===v?'default':'outline'} size="sm" onClick={()=>setQuick(t.id, v)}>{v}%</Button>
                       ))}
@@ -917,12 +1026,13 @@ const weekStats = useMemo(() => {
 
 /* ========= Subcomponents ========= */
 function GoalTasksEditor({
-  goal, tasks, onAdd, onRemove,
+  goal, tasks, onAdd, onRemove, dailyHint,
 }: {
   goal: Goal;
   tasks: Task[];
   onAdd: (goalId: string, title: string, how?: string) => void;
   onRemove: (taskId: string) => void;
+  dailyHint?: string;
 }) {
   const [title, setTitle] = useState('');
   const [how, setHow] = useState('');
@@ -937,7 +1047,9 @@ function GoalTasksEditor({
     <div className="p-3 rounded-md border">
       <div className="flex items-center justify-between mb-2">
         <div className="font-medium">{goal.title}</div>
-        <div className="text-xs text-muted-foreground">Daily weight: {goal.dailyWeight ?? 5}%</div>
+        <div className="text-xs text-muted-foreground">
+          Daily weight: {goal.dailyWeight ?? 5}%{dailyHint ? ` • ${dailyHint}` : ''}
+        </div>
       </div>
       <div className="flex items-center gap-2">
         <Input placeholder="Task (tiny and specific)" value={title} onChange={(e) => setTitle(e.target.value)} />
