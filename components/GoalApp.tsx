@@ -707,10 +707,13 @@ export default function GoalsApp() {
     // Goals (live)
     const goalsQ = query(collection(db, 'users', u.uid, 'goals'), orderBy('createdAt', 'desc'));
     const unsubGoals = onSnapshot(goalsQ, (snap) => {
-      const arr = snap.docs.map(d => ({ id: d.id, ...(d.data() as unknown as Goal) }));
+    const arr = snap.docs.map((d) => {
+    const { id: _ignored, ...rest } = d.data() as Goal; 
+    return { id: d.id, ...rest } as Goal;
+  });
       setGoals(arr);
     });
-
+    
     // Today plan (live)
     const unsubPlan = onSnapshot(doc(db, 'users', u.uid, 'plans', today), (snap) => {
       const data = snap.data() as DayPlan | undefined;
