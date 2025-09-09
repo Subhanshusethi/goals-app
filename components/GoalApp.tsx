@@ -9,7 +9,6 @@ import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { Badge } from '@/components/ui/badge';
 import { Label } from '@/components/ui/label';
-  // shadcn Progress
 import { Progress } from '@/components/ui/progress';
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Separator } from '@/components/ui/separator';
@@ -29,6 +28,8 @@ import {
 /* ========= Types ========= */
 type Priority = 'Low' | 'Medium' | 'High';
 type GoalStatus = 'Active' | 'Paused' | 'Completed' | 'Dropped';
+type Tried = 'Yes' | 'No' | 'Neutral';
+type TriedOrEmpty = Tried | '';
 
 interface Goal {
   id: string;
@@ -44,12 +45,14 @@ interface Goal {
   updatedAt: string;
 }
 
+type PercentChoice = 0 | 5 | 20 | 50 | 100;
+
 interface Task {
   id: string;
   goalId: string;
   title: string;
   how?: string;
-  percent: 0 | 5 | 20 | 50 | 100;
+  percent: PercentChoice;
   postponed?: boolean;
   postponeReason?: string;
   postponeConsequence?: string;
@@ -66,7 +69,7 @@ interface DayMeta {
   date: string;
   learned?: string;
   improve?: string;
-  triedWell?: 'Yes' | 'No' | 'Neutral';
+  triedWell?: Tried;
   whyNotComplete?: string;  // required if any task < 100%
   eodSubmitted?: boolean;
 }
@@ -83,6 +86,7 @@ const yesterdayStr = () => { const d = new Date(); d.setDate(d.getDate() - 1); r
 const uid = () => Math.random().toString(36).slice(2, 10);
 const clamp = (n: number, min: number, max: number) => Math.min(Math.max(n, min), max);
 const fmtDateLong = () => new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'short', day: 'numeric' });
+const PCT: readonly PercentChoice[] = [0, 5, 20, 50, 100] as const;
 
 /* ========= Seeds / Storage ========= */
 const seedGoals: Goal[] = [
@@ -181,11 +185,13 @@ function CatchUpDialog({
 }) {
   const [learned, setLearned] = useState('');
   const [improve, setImprove] = useState('');
-  const [triedWell, setTriedWell] = useState<'Yes' | 'No' | 'Neutral' | ''>('');
+  const [triedWell, setTriedWell] = useState<TriedOrEmpty>('');
   const [why, setWhy] = useState('');
 
   const hasIncomplete = tasks.some((t) => t.percent < 100);
   const canSubmit = triedWell !== '' && (!hasIncomplete || (why && why.trim().length > 0));
+
+  const triedFinal: Tried = (triedWell === '' ? 'Neutral' : triedWell) as Tried;
 
   return (
     <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
@@ -211,7 +217,10 @@ function CatchUpDialog({
           )}
         </div>
         <DialogFooter>
-          <Button disabled={!canSubmit} onClick={() => onSubmit({ date, learned, improve, triedWell: triedWell as any, whyNotComplete: why, eodSubmitted: true })}>
+          <Button
+            disabled={!canSubmit}
+            onClick={() => onSubmit({ date, learned, improve, triedWell: triedFinal, whyNotComplete: hasIncomplete ? why : '', eodSubmitted: true })}
+          >
             <CheckCircle2 className="h-4 w-4 mr-2" />Close day
           </Button>
         </DialogFooter>
@@ -317,7 +326,7 @@ export default function GoalsApp() {
   };
 
   /* ========= Day tapping ========= */
-  const setTaskPercent = (taskId: string, v: Task['percent']) => {
+  const setTaskPercent = (taskId: string, v: PercentChoice) => {
     if (planToday.locked) return;
     setPlans((prev) => {
       const cur = prev[today]; if (!cur) return prev;
@@ -350,17 +359,19 @@ export default function GoalsApp() {
   /* ========= End of Day ========= */
   const [learned, setLearned] = useState('');
   const [improve, setImprove] = useState('');
-  const [tried, setTried] = useState<'Yes' | 'No' | 'Neutral' | ''>('');
+  const [tried, setTried] = useState<TriedOrEmpty>('');
   const [whyNot, setWhyNot] = useState('');
 
+  // hydrate EOD inputs if previously saved (rare)
   useEffect(() => {
+    if (!ready) return;
     const m = meta[today];
     if (!m) return;
     setLearned(m.learned || '');
     setImprove(m.improve || '');
-    setTried((m.triedWell as any) || '');
+    setTried(m.triedWell ?? '');
     setWhyNot(m.whyNotComplete || '');
-  }, [ready]);
+  }, [ready, meta, today]);
 
   const hasIncomplete = todayTasks.some((t) => t.percent < 100);
   const canClose = planToday.tasks.length > 0 &&
@@ -391,10 +402,11 @@ export default function GoalsApp() {
     );
 
     // 2) save meta & lock plan
+    const triedFinal: Tried = (tried === '' ? 'Neutral' : tried) as Tried;
     const nextMeta: DayMeta = {
       date: today,
       learned, improve,
-      triedWell: tried as any,
+      triedWell: triedFinal,
       whyNotComplete: hasIncomplete ? whyNot : '',
       eodSubmitted: true,
     };
@@ -406,7 +418,6 @@ export default function GoalsApp() {
   };
 
   /* ========= Stats / Widgets ========= */
-  // map tasks by goal for today
   const todayByGoal = useMemo(() => {
     const map = new Map<string, Task[]>();
     for (const t of todayTasks) {
@@ -416,11 +427,9 @@ export default function GoalsApp() {
     return map;
   }, [todayTasks]);
 
-  // priorities convenience
   const priorities = (planToday.priorities.map((id) => goals.find((g) => g.id === id)).filter(Boolean) as Goal[]);
   const nonPriorities = goals.filter((g) => !planToday.priorities.includes(g.id) && g.status === 'Active');
 
-  // day overview stats
   const dayStats = useMemo(() => {
     const total = todayTasks.length;
     const done = todayTasks.filter((t) => t.percent === 100).length;
@@ -429,7 +438,6 @@ export default function GoalsApp() {
     return { total, done, postponed, avg };
   }, [todayTasks]);
 
-  // per-goal today average & estimated delta
   const perGoalToday = useMemo(() => {
     return priorities.map((g) => {
       const list = todayByGoal.get(g.id) || [];
@@ -438,9 +446,8 @@ export default function GoalsApp() {
       const projected = clamp(g.progress + delta, 0, 100);
       return { goal: g, avg, delta, projected };
     });
-  }, [priorities, todayByGoal, goals]);
+  }, [priorities, todayByGoal]); // goals dep not needed (priorities contains goal objects)
 
-  // streak: consecutive locked days
   const streak = useMemo(() => {
     let c = 0;
     const d = new Date();
@@ -616,8 +623,8 @@ export default function GoalsApp() {
                     ) : null}
                   </div>
                   <div className="flex items-center gap-2">
-                    {[0, 5, 20, 50, 100].map((v) => (
-                      <Button key={v} size="sm" variant={t.percent === v ? 'default' : 'outline'} onClick={() => setTaskPercent(t.id, v as any)}>
+                    {PCT.map((v) => (
+                      <Button key={v} size="sm" variant={t.percent === v ? 'default' : 'outline'} onClick={() => setTaskPercent(t.id, v)}>
                         {v}%
                       </Button>
                     ))}
