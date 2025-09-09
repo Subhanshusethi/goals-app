@@ -361,6 +361,32 @@ export default function GoalsApp() {
       };
     });
   };
+  // Week helpers: ISO week starting Monday
+const startOfWeek = (isoDate: string) => {
+  const d = new Date(isoDate + 'T00:00:00');
+  // make Monday=0 … Sunday=6
+  const weekday = (d.getDay() + 6) % 7;
+  d.setDate(d.getDate() - weekday);
+  return yyyymmdd(d);
+};
+
+const endOfWeek = (isoDate: string) => {
+  const s = new Date(startOfWeek(isoDate) + 'T00:00:00');
+  s.setDate(s.getDate() + 6);
+  return yyyymmdd(s);
+};
+
+const dateRange = (start: string, end: string) => {
+  const out: string[] = [];
+  const d = new Date(start + 'T00:00:00');
+  const e = new Date(end + 'T00:00:00');
+  while (d <= e) {
+    out.push(yyyymmdd(d));
+    d.setDate(d.getDate() + 1);
+  }
+  return out;
+};
+
   const setQuick = (taskId: string, v: number) => {
     if (planToday.locked) return;
     setPlans((prev) => {
@@ -471,6 +497,63 @@ export default function GoalsApp() {
   const priorities = (planToday.priorities.map((id) => goals.find((g) => g.id === id)).filter(Boolean) as Goal[]);
   const nonPriorities = goals.filter((g) => !planToday.priorities.includes(g.id) && g.status === 'Active');
 
+  // --- Weekly goal-centric progress (Mon–Sun of the current week) ---
+const weekStats = useMemo(() => {
+  const start = startOfWeek(today);
+  const end = endOfWeek(today);
+  const days = dateRange(start, end);
+
+  let actual = 0; // sum of deltas applied across all goals/days
+  let max = 0;    // sum of dailyWeight for goals that had tasks that day
+
+  // aggregate per-goal for the week (for mini bars)
+  const perGoalAgg = new Map<string, { title: string; actual: number; max: number }>();
+
+  for (const day of days) {
+    const dayPlan = plans[day];
+    if (!dayPlan || dayPlan.tasks.length === 0) continue;
+
+    // group tasks by goal for that day
+    const byGoal = new Map<string, Task[]>();
+    for (const t of dayPlan.tasks) {
+      const arr = byGoal.get(t.goalId) || [];
+      arr.push(t);
+      byGoal.set(t.goalId, arr);
+    }
+
+    // compute delta per goal for that day
+    byGoal.forEach((list, gid) => {
+      const g = goals.find((x) => x.id === gid);
+      const weight = g?.dailyWeight ?? 5;
+      const avg = Math.round(list.reduce((s, t) => s + t.percent, 0) / list.length); // 0..100
+      const delta = Math.round((avg / 100) * weight); // integer points
+
+      actual += delta;
+      max += weight;
+
+      const current = perGoalAgg.get(gid) || { title: g?.title ?? 'Unknown goal', actual: 0, max: 0 };
+      current.actual += delta;
+      current.max += weight;
+      perGoalAgg.set(gid, current);
+    });
+  }
+
+  const percent = max ? Math.round((actual / max) * 100) : 0;
+
+  const perGoal = Array.from(perGoalAgg.entries())
+    .map(([id, v]) => ({
+      id,
+      title: v.title,
+      percent: v.max ? Math.round((v.actual / v.max) * 100) : 0,
+      actual: v.actual,
+      max: v.max,
+    }))
+    .sort((a, b) => b.actual - a.actual);
+
+  return { start, end, actual, max, percent, perGoal };
+}, [plans, goals, today]);
+
+
   const dayStats = useMemo(() => {
     const total = todayTasks.length;
     const done = todayTasks.filter((t) => t.percent === 100).length;
@@ -564,6 +647,52 @@ export default function GoalsApp() {
           </div>
         </CardContent>
       </Card>
+      {/* This Week (Goal-centric) */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center justify-between">
+            <span>This Week (Goal-centric)</span>
+            <span className="text-xs text-muted-foreground">
+              {weekStats.start} → {weekStats.end}
+            </span>
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid gap-4 md:grid-cols-4 items-center">
+            <div className="flex items-center gap-4">
+              <Ring value={weekStats.percent} />
+              <div>
+                <div className="text-sm text-muted-foreground">Weekly completion</div>
+                <div className="text-2xl font-semibold">{weekStats.percent}%</div>
+                <div className="text-xs text-muted-foreground">
+                  Actual {weekStats.actual} / Max {weekStats.max} pts
+                </div>
+              </div>
+            </div>
+            {/* quick stats */}
+            <div className="p-3 rounded-lg border md:col-span-3">
+              <div className="text-xs text-muted-foreground mb-2">Per-goal momentum this week</div>
+              {weekStats.perGoal.length === 0 && (
+                <div className="text-xs text-muted-foreground">No activity yet this week.</div>
+              )}
+              <div className="space-y-2">
+                {weekStats.perGoal.slice(0, 5).map((g) => (
+                  <div key={g.id}>
+                    <div className="flex items-center justify-between text-xs mb-1">
+                      <span className="font-medium truncate">{g.title}</span>
+                      <span className="text-muted-foreground">
+                        {g.percent}% • {g.actual}/{g.max} pts
+                      </span>
+                    </div>
+                    <Progress value={g.percent} />
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
 
       {/* Long-term goals */}
       <Card>
