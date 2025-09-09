@@ -1271,7 +1271,7 @@ export default function GoalsApp() {
             ))}
           </div>
           <div className="text-xs text-muted-foreground">
-            Legend: <span className="px-2 py-0.5 rounded bg-green-500/80 text-white">>70%</span>{' '}
+            Legend: <span className="px-2 py-0.5 rounded bg-green-500/80 text-white">70%</span>{' '}
             <span className="px-2 py-0.5 rounded bg-yellow-400/80 text-black">51–70%</span>{' '}
             <span className="px-2 py-0.5 rounded bg-red-500/80 text-white">≤50%</span>{' '}
             <span className="px-2 py-0.5 rounded bg-muted">no data</span>
