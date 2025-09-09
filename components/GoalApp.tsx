@@ -17,8 +17,6 @@ import {
   CheckCircle2,
   ChevronDown,
   ChevronUp,
-  ChevronLeft,
-  ChevronRight,
   Flame,
   History,
   ListChecks,
@@ -55,14 +53,14 @@ interface Task {
   title: string;
   how?: string;
   percent: number;         // 0..100 (we step by 5 via +/-)
-  postponed?: boolean;
-  postponeReason?: string;
+  postponed?: boolean;     // info tag if user postponed during the day
+  postponeReason?: string; // optional reason
 }
 
 interface DayPlan {
   date: string;             // YYYY-MM-DD
   priorities: string[];     // ordered goalIds
-  tasks: Task[];            // day’s tasks
+  tasks: Task[];            // today’s tasks
   locked?: boolean;         // locked when EOD submitted
 }
 
@@ -83,18 +81,12 @@ const LS_META  = 'daymeta_v2';
 /* ========= Helpers ========= */
 const todayStr = () => new Date().toISOString().slice(0, 10);
 const yyyymmdd = (d: Date) => d.toISOString().slice(0, 10);
-const shiftDate = (dateStr: string, deltaDays: number) => {
-  const d = new Date(dateStr + 'T00:00:00');
-  d.setDate(d.getDate() + deltaDays);
-  return yyyymmdd(d);
-};
-const tomorrowStr = () => shiftDate(todayStr(), 1);
-const yesterdayStr = () => shiftDate(todayStr(), -1);
+const tomorrowStr = () => { const d = new Date(); d.setDate(d.getDate() + 1); return yyyymmdd(d); };
+const yesterdayStr = () => { const d = new Date(); d.setDate(d.getDate() - 1); return yyyymmdd(d); };
 const uid = () => Math.random().toString(36).slice(2, 10);
 const clamp = (n: number, min: number, max: number) => Math.min(Math.max(n, min), max);
 const step = (n: number, delta = 5) => clamp(Math.round((n + delta) / 5) * 5, 0, 100);
-const fmtDateLong = (iso?: string) =>
-  (iso ? new Date(iso) : new Date()).toLocaleDateString(undefined, { weekday: 'long', month: 'short', day: 'numeric' });
+const fmtDateLong = () => new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'short', day: 'numeric' });
 const isTried = (v: TriedOrEmpty): v is Tried => v === 'Yes' || v === 'No' || v === 'Neutral';
 
 /* ========= Seeds / Storage ========= */
@@ -119,7 +111,7 @@ const load = <T,>(key: string, fallback: T): T => {
 };
 const save = (key: string, value: unknown) => localStorage.setItem(key, JSON.stringify(value));
 
-/* ========= Pretty Ring (Today/Day %) ========= */
+/* ========= Pretty Ring (Today %) ========= */
 function Ring({ value, size = 72 }: { value: number; size?: number }) {
   const pct = clamp(Math.round(value), 0, 100);
   const bg = `conic-gradient(hsl(var(--primary)) ${pct}%, hsl(var(--muted-foreground)/.15) ${pct}%)`;
@@ -198,7 +190,7 @@ function GoalModal({
   );
 }
 
-/* ========= Catch-up (ensure yesterday closed) ========= */
+/* ========= Catch-up (yesterday must be closed) ========= */
 function CatchUpDialog({
   open, onClose, date, tasks, onSubmit,
 }: {
@@ -253,176 +245,6 @@ function CatchUpDialog({
   );
 }
 
-/* ========= NEW: History Dialog ========= */
-function HistoryDialog({
-  open, onOpenChange, date, setDate, plan, meta, goals,
-}: {
-  open: boolean;
-  onOpenChange: (v: boolean) => void;
-  date: string;
-  setDate: (d: string) => void;
-  plan: DayPlan | undefined;
-  meta: DayMeta | undefined;
-  goals: Goal[];
-}) {
-  const tasks = plan?.tasks ?? [];
-  const totals = useMemo(() => {
-    const total = tasks.length;
-    const done = tasks.filter(t => t.percent === 100).length;
-    const postponed = tasks.filter(t => t.postponed).length;
-    const avg = total ? Math.round(tasks.reduce((s, t) => s + t.percent, 0) / total) : 0;
-    return { total, done, postponed, avg };
-  }, [tasks]);
-
-  // Per-goal breakdown for the selected day
-  const perGoal = useMemo(() => {
-    const by = new Map<string, Task[]>();
-    for (const t of tasks) {
-      if (!by.has(t.goalId)) by.set(t.goalId, []);
-      by.get(t.goalId)!.push(t);
-    }
-    const rows: { goal: Goal | undefined; avg: number; delta: number }[] = [];
-    for (const [gid, list] of by) {
-      const g = goals.find(x => x.id === gid);
-      const avg = list.length ? Math.round(list.reduce((s, t) => s + t.percent, 0) / list.length) : 0;
-      const delta = Math.round((avg / 100) * (g?.dailyWeight ?? 5));
-      rows.push({ goal: g, avg, delta });
-    }
-    // Keep stable order: by priorities if we have them
-    return rows;
-  }, [tasks, goals]);
-
-  const locked = !!plan?.locked;
-  const hasMeta = !!meta?.eodSubmitted;
-
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-3xl">
-        <DialogHeader>
-          <div className="flex items-center justify-between">
-            <DialogTitle>History / Journal</DialogTitle>
-            <div className="flex items-center gap-2">
-              <Button variant="outline" size="icon" onClick={()=> setDate(shiftDate(date, -1))}><ChevronLeft className="h-4 w-4"/></Button>
-              <Input type="date" value={date} onChange={(e)=> setDate(e.target.value)} className="w-[150px]"/>
-              <Button variant="outline" size="icon" onClick={()=> setDate(shiftDate(date, +1))}><ChevronRight className="h-4 w-4"/></Button>
-            </div>
-          </div>
-          <div className="text-sm text-muted-foreground flex items-center gap-2">
-            <CalendarIcon className="h-4 w-4" /> {fmtDateLong(date)} • {date}
-            <span className="ml-2 text-xs px-2 py-0.5 rounded bg-muted">
-              {locked && hasMeta ? 'Closed' : plan ? 'Open (not closed)' : 'No plan'}
-            </span>
-          </div>
-        </DialogHeader>
-
-        {/* Summary */}
-        <div className="grid gap-4 md:grid-cols-4 items-center">
-          <div className="flex items-center gap-4">
-            <Ring value={totals.avg} />
-            <div>
-              <div className="text-sm text-muted-foreground">Day completion</div>
-              <div className="text-2xl font-semibold">{totals.avg}%</div>
-            </div>
-          </div>
-          <div className="p-3 rounded-lg border">
-            <div className="text-xs text-muted-foreground">Planned tasks</div>
-            <div className="text-xl font-semibold">{totals.total}</div>
-          </div>
-          <div className="p-3 rounded-lg border">
-            <div className="text-xs text-muted-foreground">Done</div>
-            <div className="text-xl font-semibold">{totals.done}</div>
-          </div>
-          <div className="p-3 rounded-lg border">
-            <div className="text-xs text-muted-foreground">Postponed</div>
-            <div className="text-xl font-semibold">{totals.postponed}</div>
-          </div>
-          <div className="md:col-span-4">
-            <div className="flex justify-between text-xs mb-1 text-muted-foreground">
-              <span>Day progress</span><span>{totals.avg}%</span>
-            </div>
-            <Progress value={totals.avg}/>
-          </div>
-        </div>
-
-        <Separator className="my-4"/>
-
-        {/* Per-goal for the day */}
-        <div className="space-y-3">
-          <div className="text-sm font-medium">Per-goal impact (that day)</div>
-          {perGoal.length === 0 && <div className="text-xs text-muted-foreground">No goal activity recorded.</div>}
-          {perGoal.map(({ goal, avg, delta }, idx) => (
-            <div key={(goal?.id ?? 'unknown') + idx}>
-              <div className="flex items-center justify-between text-xs mb-1">
-                <span className="font-medium truncate">{goal?.title ?? 'Unknown goal'}</span>
-                <span className="text-muted-foreground">Avg {avg}% → +{delta}%</span>
-              </div>
-              <Progress value={avg}/>
-              <div className="text-[10px] text-muted-foreground mt-1">Weight {goal?.dailyWeight ?? 5}% • Estimated delta +{delta}%</div>
-            </div>
-          ))}
-        </div>
-
-        <Separator className="my-4"/>
-
-        {/* Task list for that day */}
-        <div className="space-y-2">
-          <div className="text-sm font-medium">Tasks</div>
-          {tasks.length === 0 && <div className="text-xs text-muted-foreground">No tasks for this day.</div>}
-          {tasks.map((t) => {
-            const g = goals.find(x => x.id === t.goalId);
-            return (
-              <div key={t.id} className="flex items-center justify-between p-2 rounded-md border">
-                <div className="min-w-0">
-                  <div className="font-medium truncate">{t.title}</div>
-                  <div className="text-xs text-muted-foreground truncate">
-                    {(g?.title ?? 'Unknown goal')}{t.how ? ` • How: ${t.how}` : ''}
-                  </div>
-                  {t.postponed && t.postponeReason && (
-                    <div className="text-xs text-amber-600 mt-1">Postponed: {t.postponeReason}</div>
-                  )}
-                </div>
-                <div className="w-16 text-center text-sm font-medium">{t.percent}%</div>
-              </div>
-            );
-          })}
-        </div>
-
-        <Separator className="my-4"/>
-
-        {/* Reflections */}
-        <div className="space-y-2">
-          <div className="text-sm font-medium">Reflection</div>
-          {!meta && <div className="text-xs text-muted-foreground">No reflection captured.</div>}
-          {meta && (
-            <div className="grid gap-3">
-              <div>
-                <div className="text-xs text-muted-foreground mb-1">Did you try well?</div>
-                <div className="text-sm">{meta.triedWell ?? '—'}</div>
-              </div>
-              <div>
-                <div className="text-xs text-muted-foreground mb-1">Why not completed?</div>
-                <div className="text-sm whitespace-pre-wrap">{meta.whyNotComplete || '—'}</div>
-              </div>
-              <div>
-                <div className="text-xs text-muted-foreground mb-1">How improve tomorrow</div>
-                <div className="text-sm whitespace-pre-wrap">{meta.improve || '—'}</div>
-              </div>
-              <div>
-                <div className="text-xs text-muted-foreground mb-1">What did you learn?</div>
-                <div className="text-sm whitespace-pre-wrap">{meta.learned || '—'}</div>
-              </div>
-            </div>
-          )}
-        </div>
-
-        <DialogFooter>
-          <Button variant="outline" onClick={()=> onOpenChange(false)}>Close</Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
 /* ========= Main App ========= */
 export default function GoalsApp() {
   const [goals, setGoals] = useState<Goal[]>([]);
@@ -438,11 +260,7 @@ export default function GoalsApp() {
   const [catchDate, setCatchDate] = useState<string>('');
   const [catchTasks, setCatchTasks] = useState<Task[]>([]);
 
-  // history state
-  const [histOpen, setHistOpen] = useState(false);
-  const [histDate, setHistDate] = useState<string>(todayStr());
-
-  // EOD postpone selections (existing)
+  // EOD postpone selections
   const [postponeMap, setPostponeMap] = useState<Record<string, boolean>>({});
 
   const today = todayStr();
@@ -602,20 +420,23 @@ export default function GoalsApp() {
       }),
     );
 
-    // 2) (existing postpone-to-tomorrow and lock logic is unchanged)
+    // 2) build tomorrow plan if needed; move postponed items
+    const tomorrow = tomorrowStr();
     const incomplete = todayTasks.filter(t => t.percent < 100 && postponeMap[t.id]);
     if (incomplete.length) {
-      const tomorrow = tomorrowStr();
       setPlans(prev => {
         const tPlan = prev[tomorrow] || { date: tomorrow, priorities: [], tasks: [] };
+        // ensure priorities include the goals of postponed tasks (keep order from today if possible)
         const addGoals = Array.from(new Set(incomplete.map(t => t.goalId)));
         const mergedPriorities = [...tPlan.priorities];
         for (const gid of addGoals) if (!mergedPriorities.includes(gid)) mergedPriorities.push(gid);
-        const moved: Task[] = incomplete.map(t => ({ id: uid(), goalId: t.goalId, title: t.title, how: t.how, percent: 0 }));
+        const moved: Task[] = incomplete.map(t => ({
+          id: uid(), goalId: t.goalId, title: t.title, how: t.how, percent: 0,
+        }));
         return {
           ...prev,
           [tomorrow]: { ...tPlan, priorities: mergedPriorities, tasks: [...moved, ...tPlan.tasks] },
-          [today]: { ...(prev[today] || planToday), locked: true },
+          [today]: { ...(prev[today] || planToday), locked: true }, // lock today
         };
       });
     } else {
@@ -666,7 +487,7 @@ export default function GoalsApp() {
       const projected = clamp(g.progress + delta, 0, 100);
       return { goal: g, avg, delta, projected };
     });
-  }, [priorities, todayByGoal, goals]); // include goals to satisfy hooks lint
+  }, [priorities, todayByGoal]);
 
   const streak = useMemo(() => {
     let c = 0;
@@ -692,18 +513,13 @@ export default function GoalsApp() {
             <h1 className="text-2xl font-semibold">{NAME}</h1>
           </div>
         </div>
-        <div className="flex items-center gap-2">
-          <Button variant="outline" size="sm" onClick={()=> setHistOpen(true)}>
-            <History className="h-4 w-4 mr-1" />History
-          </Button>
-          <div className="text-right">
-            <div className="text-sm text-muted-foreground flex items-center gap-2 justify-end">
-              <CalendarIcon className="h-4 w-4" />
-              <span>{fmtDateLong()} • {today}</span>
-            </div>
-            <div className="text-xs text-muted-foreground flex items-center gap-1 justify-end">
-              <Flame className="h-4 w-4 text-orange-500" /> <span>Streak: {streak}</span>
-            </div>
+        <div className="text-right">
+          <div className="text-sm text-muted-foreground flex items-center gap-2 justify-end">
+            <CalendarIcon className="h-4 w-4" />
+            <span>{fmtDateLong()} • {today}</span>
+          </div>
+          <div className="text-xs text-muted-foreground flex items-center gap-1 justify-end">
+            <Flame className="h-4 w-4 text-orange-500" /> <span>Streak: {streak}</span>
           </div>
         </div>
       </div>
@@ -765,7 +581,7 @@ export default function GoalsApp() {
               </div>
               <div className="text-xs text-muted-foreground mt-1">{g.note}</div>
               <div className="text-xs text-muted-foreground flex items-center gap-2 mt-1">
-                <CalendarIcon className="h-3.5 w-3.5" /> {g.startDate} • Target {g.targetDate}
+                <CalendarIcon className="h-3.5 w-3.5" /> {g.startDate} → {g.targetDate}
               </div>
               <div className="mt-2">
                 <div className="flex justify-between text-xs mb-1">
@@ -815,10 +631,10 @@ export default function GoalsApp() {
           <div className="space-y-2">
             <Label className="text-sm">Available goals</Label>
             <div className="flex flex-wrap gap-2">
-              {nonPriorities.map((g) => (
+              {goals.filter(g=>!planToday.priorities.includes(g.id) && g.status==='Active').map((g) => (
                 <Button key={g.id} variant="outline" size="sm" onClick={() => addPriority(g.id)}>{g.title}</Button>
               ))}
-              {nonPriorities.length === 0 && (
+              {goals.filter(g=>!planToday.priorities.includes(g.id) && g.status==='Active').length === 0 && (
                 <div className="text-xs text-muted-foreground">All active goals selected.</div>
               )}
             </div>
@@ -872,6 +688,7 @@ export default function GoalsApp() {
                       <Button variant="outline" size="icon" onClick={()=>incTask(t.id, -5)} aria-label="decrease"><Minus className="h-4 w-4" /></Button>
                       <div className="w-14 text-center text-sm font-medium">{t.percent}%</div>
                       <Button variant="outline" size="icon" onClick={()=>incTask(t.id, +5)} aria-label="increase"><Plus className="h-4 w-4" /></Button>
+                      {/* quick jumps */}
                       {[0,25,50,100].map(v=>(
                         <Button key={v} variant={t.percent===v?'default':'outline'} size="sm" onClick={()=>setQuick(t.id, v)}>{v}%</Button>
                       ))}
@@ -964,15 +781,6 @@ export default function GoalsApp() {
           setPlans((p) => ({ ...p, [catchDate]: { ...(p[catchDate] || { date: catchDate, priorities: [], tasks: [] }), locked: true } }));
           setCatchOpen(false);
         }}
-      />
-      <HistoryDialog
-        open={histOpen}
-        onOpenChange={setHistOpen}
-        date={histDate}
-        setDate={setHistDate}
-        plan={plans[histDate]}
-        meta={meta[histDate]}
-        goals={goals}
       />
     </div>
   );
