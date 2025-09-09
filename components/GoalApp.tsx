@@ -28,6 +28,11 @@ import {
   History as HistoryIcon,
 } from 'lucide-react';
 
+import { auth, db } from '@/lib/firebase';
+import {
+  doc, setDoc, getDocs, onSnapshot, collection, query, orderBy, deleteDoc, where,
+} from 'firebase/firestore';
+
 /* ========= Types ========= */
 type Priority = 'Low' | 'Medium' | 'High';
 type GoalStatus = 'Active' | 'Paused' | 'Completed' | 'Dropped';
@@ -36,13 +41,13 @@ type Tried = 'Yes' | 'No' | 'Neutral';
 interface Goal {
   id: string;
   title: string;
-  note: string;        // short note answering how & why
+  note: string;
   startDate: string;
-  targetDate: string;  // target date (end)
+  targetDate: string;
   priority: Priority;
   status: GoalStatus;
   progress: number;    // 0–100
-  dailyWeight?: number; // how much a fully-complete day contributes, in % (default 5)
+  dailyWeight?: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -52,7 +57,7 @@ interface Task {
   goalId: string;
   title: string;
   how?: string;
-  percent: number;         // 0..100 (we step by 5 via +/-)
+  percent: number; // 0..100
 }
 
 interface FocusSession {
@@ -60,19 +65,19 @@ interface FocusSession {
   startISO: string;
   endISO: string;
   durationMin: number;
-  acknowledgedAt: string[]; // ISO timestamps for each 15-min ack
+  acknowledgedAt: string[];
   status: 'completed' | 'failed' | 'canceled';
 }
 
 interface DayPlan {
   date: string;                         // YYYY-MM-DD
-  priorities: string[];                 // ordered goalIds
-  tasks: Task[];                        // today’s tasks
-  credits?: Record<string, number>;     // goalId -> integer delta applied today
-  postponeFlags?: Record<string, boolean>; // taskId -> true if user chose to move to tomorrow
-  carriedFrom?: string;                 // last date we auto-carried from (e.g., yesterday)
-  focusedCount?: number;                // completed focused sessions today
-  focusedSessions?: FocusSession[];     // log of focus sessions for this date
+  priorities: string[];
+  tasks: Task[];
+  credits?: Record<string, number>;
+  postponeFlags?: Record<string, boolean>;
+  carriedFrom?: string;
+  focusedCount?: number;
+  focusedSessions?: FocusSession[];
 }
 
 interface DayMeta {
@@ -97,31 +102,24 @@ const step = (n: number, delta = 5) => clamp(Math.round((n + delta) / 5) * 5, 0,
 const fmtDateLong = () => new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'short', day: 'numeric' });
 const yesterdayStr = () => { const d = new Date(); d.setDate(d.getDate()-1); return yyyymmdd(d); };
 
-/** Inclusive days left: 9→11 = 3, if past due returns 0 */
 const daysLeftInclusive = (fromISO: string, toISO: string): number => {
   const from = new Date(fromISO + 'T00:00:00');
   const to = new Date(toISO + 'T00:00:00');
   const diff = Math.floor((to.getTime() - from.getTime()) / (1000 * 60 * 60 * 24));
   return diff < 0 ? 0 : diff + 1;
 };
-
-/** Positive days overdue if after target */
 const daysOverdue = (fromISO: string, toISO: string): number => {
   const from = new Date(fromISO + 'T00:00:00');
   const to = new Date(toISO + 'T00:00:00');
   const diff = Math.floor((from.getTime() - to.getTime()) / (1000 * 60 * 60 * 24));
   return diff > 0 ? diff : 0;
 };
-
-/** With current weight: what daily average % is needed to hit the date? */
 const requiredAvgWithCurrentWeight = (remainingPct: number, daysLeft: number, weight: number): number => {
   if (remainingPct <= 0) return 0;
   if (daysLeft <= 0 || weight <= 0) return 100;
   const needed = Math.ceil((remainingPct / (daysLeft * weight)) * 100);
   return clamp(needed, 0, 100);
 };
-
-/** If user typically averages `expectedAvgPct` per day, what daily weight should they set to hit the date? */
 const suggestedWeightToHit = (remainingPct: number, daysLeft: number, expectedAvgPct: number): number => {
   if (remainingPct <= 0) return 5;
   const eff = expectedAvgPct / 100;
@@ -136,7 +134,6 @@ const load = <T,>(key: string, fallback: T): T => {
 const save = (key: string, value: unknown) => localStorage.setItem(key, JSON.stringify(value));
 
 /* ========= Week / Calendar helpers ========= */
-// ISO week starting Monday
 const startOfWeek = (isoDate: string) => {
   const d = new Date(isoDate + 'T00:00:00');
   const weekday = (d.getDay() + 6) % 7; // Mon=0…Sun=6
@@ -224,7 +221,6 @@ function GoalModal({
             <Label>Short note — how & why</Label>
             <Textarea rows={3} value={note} onChange={(e)=>setNote(e.target.value)} placeholder="How will you do it? Why does it matter?" />
           </div>
-          
           <div>
             <Label>Priority</Label>
             <div className="flex gap-2 mt-1">
@@ -240,7 +236,6 @@ function GoalModal({
               ))}
             </div>
           </div>
-
           <div>
             <Label>Target date</Label>
             <Input type="date" value={targetDate} onChange={(e)=>setTargetDate(e.target.value)} />
@@ -257,11 +252,11 @@ function GoalModal({
 
 /* ========= Focused Session Panel ========= */
 function FocusPanel({
-  dateKey, plan, setPlans,
+  dateKey, plan, updatePlan,
 }: {
   dateKey: string;
   plan: DayPlan;
-  setPlans: React.Dispatch<React.SetStateAction<Record<string, DayPlan>>>;
+  updatePlan: (producer: (cur: DayPlan) => DayPlan) => void;
 }) {
   const [durationMin, setDurationMin] = useState<number>(30);
   const [running, setRunning] = useState(false);
@@ -273,7 +268,6 @@ function FocusPanel({
   const startTimeRef = useRef<number | null>(null);
   const tickRef = useRef<number | null>(null);
 
-  // cleanup
   useEffect(() => () => { if (tickRef.current) window.clearInterval(tickRef.current); }, []);
 
   const recordSession = (status: FocusSession['status']) => {
@@ -287,8 +281,7 @@ function FocusPanel({
       acknowledgedAt: [...ackTimes],
       status,
     };
-    setPlans(prev => {
-      const cur = prev[dateKey] || { date: dateKey, priorities: [], tasks: [] };
+    updatePlan((cur) => {
       const fc = cur.focusedCount ?? 0;
       const list = cur.focusedSessions ?? [];
       let nextFocusedCount = fc;
@@ -298,14 +291,12 @@ function FocusPanel({
         nextFocusedCount = fc + 1;
         nextList = [session, ...list];
       } else if (status === 'failed') {
-        // per requirement: reset to 0 and discard sessions
         nextFocusedCount = 0;
         nextList = [];
       } else {
-        // canceled: keep existing, just log it (optional: comment out to ignore canceled)
         nextList = [session, ...list];
       }
-      return { ...prev, [dateKey]: { ...cur, focusedCount: nextFocusedCount, focusedSessions: nextList } };
+      return { ...cur, focusedCount: nextFocusedCount, focusedSessions: nextList };
     });
   };
 
@@ -323,7 +314,7 @@ function FocusPanel({
   };
 
   const startTimer = () => {
-    const dur = Math.max(30, Math.round(durationMin)); // enforce 30 min minimum
+    const dur = Math.max(30, Math.round(durationMin));
     const now = Date.now();
     startTimeRef.current = now;
     const total = dur * 60;
@@ -332,31 +323,25 @@ function FocusPanel({
     setNeedsAck(false);
     setAckDeadline(null);
     setAckTimes([]);
-    setNextAckAt(now + 15 * 60 * 1000); // first ack after 15 min
+    setNextAckAt(now + 15 * 60 * 1000);
 
     if (tickRef.current) window.clearInterval(tickRef.current);
     tickRef.current = window.setInterval(() => {
-      setRemainingSec((old) => {
-        const newVal = old - 1;
-        return newVal >= 0 ? newVal : 0;
-      });
+      setRemainingSec((old) => Math.max(0, old - 1));
 
       const t = Date.now();
 
-      // trigger ack requirement
       setNextAckAt((na) => {
         if (!na) return na;
         if (t >= na && !needsAck) {
           setNeedsAck(true);
-          setAckDeadline(t + 60 * 1000); // 60s grace
+          setAckDeadline(t + 60 * 1000);
         }
         return na;
       });
 
-      // check ack timeout
       setAckDeadline((dl) => {
         if (dl && needsAck && t > dl) {
-          // failed: missed acknowledgement
           stopTimer('failed');
           return null;
         }
@@ -366,12 +351,9 @@ function FocusPanel({
       // finish timer
       setRemainingSec((val) => {
         if (val <= 1 && running) {
-          // finishing now
-          // must not be waiting for ack
           if (!needsAck) {
             stopTimer('completed');
           } else {
-            // if timer ends while ack pending, treat as fail
             stopTimer('failed');
           }
         }
@@ -385,7 +367,6 @@ function FocusPanel({
     setNeedsAck(false);
     setAckDeadline(null);
     setAckTimes((arr) => [...arr, new Date().toISOString()]);
-    // schedule next 15-min checkpoint
     setNextAckAt(Date.now() + 15 * 60 * 1000);
   };
 
@@ -495,6 +476,31 @@ export default function GoalsApp() {
 
   const today = todayStr();
 
+  /* ---- Firestore helpers: write-through ---- */
+  const writePlanToCloud = (dateKey: string, plan: DayPlan) => {
+    const u = auth.currentUser; if (!u) return;
+    setDoc(doc(db, 'users', u.uid, 'plans', dateKey), plan, { merge: false }).catch(() => {});
+  };
+  const writeMetaToCloud = (dateKey: string, m: DayMeta) => {
+    const u = auth.currentUser; if (!u) return;
+    setDoc(doc(db, 'users', u.uid, 'meta', dateKey), m, { merge: true }).catch(() => {});
+  };
+  const persistGoal = (g: Goal) => {
+    const u = auth.currentUser; if (!u) return;
+    setDoc(doc(db, 'users', u.uid, 'goals', g.id), g, { merge: true }).catch(() => {});
+  };
+
+  // single entry point to update today's plan and sync
+  const updatePlanToday = (producer: (cur: DayPlan) => DayPlan) => {
+    setPlans(prev => {
+      const cur = prev[today] || { date: today, priorities: [], tasks: [], credits: {}, postponeFlags: {}, focusedCount: 0, focusedSessions: [] };
+      const next = producer(cur);
+      const merged = { ...prev, [today]: next };
+      writePlanToCloud(today, next);
+      return merged;
+    });
+  };
+
   /* ---- init ---- */
   useEffect(() => {
     const g = load<Goal[]>(LS_GOALS, [
@@ -520,152 +526,134 @@ export default function GoalsApp() {
     setReady(true);
   }, []);
 
-  /* ---- persistence ---- */
+  /* ---- persistence (fallback for signed-out) ---- */
   useEffect(() => { if (ready) save(LS_GOALS, goals); }, [goals, ready]);
   useEffect(() => { if (ready) save(LS_PLANS, plans); }, [plans, ready]);
   useEffect(() => { if (ready) save(LS_META, meta); }, [meta, ready]);
 
-  /* ---- auto-carry postponed tasks from yesterday into today (runs once per day) ---- */
+  /* ---- auto-carry postponed tasks from yesterday ---- */
   useEffect(() => {
     if (!ready) return;
     const y = yesterdayStr();
     const yPlan = plans[y];
     const tPlan = plans[today] || { date: today, priorities: [], tasks: [], credits: {}, postponeFlags: {}, focusedCount: 0, focusedSessions: [] };
-
     if (tPlan.carriedFrom === y) return;
 
     if (!yPlan) {
-      setPlans(prev => ({ ...prev, [today]: { ...tPlan, carriedFrom: y, focusedCount: tPlan.focusedCount ?? 0, focusedSessions: tPlan.focusedSessions ?? [] } }));
+      updatePlanToday(cur => ({ ...tPlan, carriedFrom: y, focusedCount: cur.focusedCount ?? 0, focusedSessions: cur.focusedSessions ?? [] }));
       return;
     }
 
     const flags = yPlan.postponeFlags || {};
     const toMove = yPlan.tasks.filter(t => flags[t.id] && t.percent < 100);
-
     const carryGoalIds = Array.from(new Set(toMove.map(t => t.goalId)));
     const nextPriorities = [...tPlan.priorities];
     for (const gid of carryGoalIds) if (!nextPriorities.includes(gid)) nextPriorities.push(gid);
-
     const copies: Task[] = toMove.map(t => ({ id: uid(), goalId: t.goalId, title: t.title, how: t.how, percent: 0 }));
 
-    setPlans(prev => ({
-      ...prev,
-      [today]: {
-        ...tPlan,
-        carriedFrom: y,
-        priorities: nextPriorities,
-        tasks: [...copies, ...tPlan.tasks],
-        focusedCount: tPlan.focusedCount ?? 0,
-        focusedSessions: tPlan.focusedSessions ?? [],
-      }
+    updatePlanToday(cur => ({
+      ...tPlan,
+      carriedFrom: y,
+      priorities: nextPriorities,
+      tasks: [...copies, ...tPlan.tasks],
+      focusedCount: cur.focusedCount ?? 0,
+      focusedSessions: cur.focusedSessions ?? [],
     }));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ready, plans, today]);
 
   const planToday: DayPlan = plans[today] || { date: today, priorities: [], tasks: [], credits: {}, postponeFlags: {}, focusedCount: 0, focusedSessions: [] };
   const todayTasks = planToday.tasks;
 
-  /* ========= Goal CRUD ========= */
-  const addGoal = (g: Goal) => setGoals(prev => [g, ...prev]);
-  const removeGoal = (id: string) => {
+  /* ========= Goals: CRUD (cloud) ========= */
+  const addGoal = async (g: Goal) => {
+    const u = auth.currentUser;
+    if (u) {
+      await setDoc(doc(db, 'users', u.uid, 'goals', g.id), g, { merge: true });
+    }
+    // optimistic local update (snapshot will also bring it)
+    setGoals(prev => [g, ...prev]);
+  };
+
+  const removeGoal = async (id: string) => {
+    const u = auth.currentUser;
+    if (u) await deleteDoc(doc(db, 'users', u.uid, 'goals', id));
     setGoals(prev => prev.filter(x=>x.id!==id));
-    // also strip from today's plan for cleanliness
-    setPlans(prev => {
-      const cur = prev[today];
-      if (!cur) return prev;
-      return {
-        ...prev,
-        [today]: {
-          ...cur,
-          priorities: cur.priorities.filter(pid => pid !== id),
-          tasks: cur.tasks.filter(t => t.goalId !== id),
-        }
-      };
+    // also clean from today plan
+    updatePlanToday(cur => ({
+      ...cur,
+      priorities: cur.priorities.filter(pid => pid !== id),
+      tasks: cur.tasks.filter(t => t.goalId !== id),
+    }));
+  };
+
+  const updateGoalWeight = (id: string, w: number) => {
+    setGoals(prev => {
+      const g = prev.find(x => x.id === id);
+      if (!g) return prev;
+      const updated: Goal = { ...g, dailyWeight: clamp(Math.round(w), 1, 100), updatedAt: new Date().toISOString() };
+      persistGoal(updated);
+      return prev.map(x => x.id === id ? updated : x);
     });
   };
-  const updateGoalWeight = (id: string, w: number) =>
-    setGoals(prev => prev.map(g => g.id === id ? { ...g, dailyWeight: clamp(Math.round(w), 1, 100), updatedAt: new Date().toISOString() } : g));
 
   /* ========= Morning Planner ========= */
   const addPriority = (goalId: string) => {
-    setPlans((prev) => {
-      const cur = prev[today] || { date: today, priorities: [], tasks: [], credits: {}, postponeFlags: {}, focusedCount: 0, focusedSessions: [] };
-      if (cur.priorities.includes(goalId)) return prev;
-      return { ...prev, [today]: { ...cur, priorities: [...cur.priorities, goalId] } };
+    updatePlanToday(cur => {
+      if (cur.priorities.includes(goalId)) return cur;
+      return { ...cur, priorities: [...cur.priorities, goalId] };
     });
   };
   const removePriority = (goalId: string) => {
-    setPlans((prev) => {
-      const cur = prev[today] || { date: today, priorities: [], tasks: [], credits: {}, postponeFlags: {}, focusedCount: 0, focusedSessions: [] };
-      return { ...prev, [today]: { ...cur, priorities: cur.priorities.filter((g) => g !== goalId) } };
-    });
+    updatePlanToday(cur => ({ ...cur, priorities: cur.priorities.filter((g) => g !== goalId) }));
   };
   const movePriority = (goalId: string, dir: 'up' | 'down') => {
-    setPlans((prev) => {
-      const cur = prev[today] || { date: today, priorities: [], tasks: [], credits: {}, postponeFlags: {}, focusedCount: 0, focusedSessions: [] };
+    updatePlanToday(cur => {
       const idx = cur.priorities.indexOf(goalId);
-      if (idx === -1) return prev;
+      if (idx === -1) return cur;
       const to = dir === 'up' ? idx - 1 : idx + 1;
-      if (to < 0 || to >= cur.priorities.length) return prev;
+      if (to < 0 || to >= cur.priorities.length) return cur;
       const next = [...cur.priorities];
       [next[idx], next[to]] = [next[to], next[idx]];
-      return { ...prev, [today]: { ...cur, priorities: next } };
+      return { ...cur, priorities: next };
     });
   };
 
   const addTask = (goalId: string, title: string, how?: string) => {
     if (!title.trim()) return;
-    setPlans((prev) => {
-      const cur = prev[today] || { date: today, priorities: [], tasks: [], credits: {}, postponeFlags: {}, focusedCount: 0, focusedSessions: [] };
+    updatePlanToday(cur => {
       const t: Task = { id: uid(), goalId, title: title.trim(), how, percent: 0 };
-      return { ...prev, [today]: { ...cur, tasks: [t, ...cur.tasks] } };
+      return { ...cur, tasks: [t, ...cur.tasks] };
     });
   };
   const removeTask = (taskId: string) => {
-    setPlans((prev) => {
-      const cur = prev[today]; if (!cur) return prev;
+    updatePlanToday(cur => {
       const newTasks = cur.tasks.filter((t) => t.id !== taskId);
       const { [taskId]: _omit, ...restFlags } = cur.postponeFlags || {};
-      return { ...prev, [today]: { ...cur, tasks: newTasks, postponeFlags: restFlags } };
+      return { ...cur, tasks: newTasks, postponeFlags: restFlags };
     });
   };
 
-  /* ========= Day tapping ========= */
+  /* ========= Task tapping ========= */
   const incTask = (taskId: string, delta: number) => {
-    setPlans((prev) => {
-      const cur = prev[today]; if (!cur) return prev;
-      return {
-        ...prev,
-        [today]: {
-          ...cur,
-          tasks: cur.tasks.map((t) => (t.id === taskId ? { ...t, percent: step(t.percent + delta) } : t)),
-        },
-      };
-    });
+    updatePlanToday(cur => ({
+      ...cur,
+      tasks: cur.tasks.map((t) => (t.id === taskId ? { ...t, percent: step(t.percent + delta) } : t)),
+    }));
   };
   const setQuick = (taskId: string, v: number) => {
-    setPlans((prev) => {
-      const cur = prev[today]; if (!cur) return prev;
-      return {
-        ...prev,
-        [today]: {
-          ...cur,
-          tasks: cur.tasks.map((t) => (t.id === taskId ? { ...t, percent: clamp(v,0,100) } : t)),
-        },
-      };
-    });
+    updatePlanToday(cur => ({
+      ...cur,
+      tasks: cur.tasks.map((t) => (t.id === taskId ? { ...t, percent: clamp(v,0,100) } : t)),
+    }));
   };
 
-  /* ========= DYNAMIC PROGRESS APPLIER =========
-     - Computes per-goal credit = round(avg(today)% * dailyWeight / 100)
-     - Applies ONLY the difference from last applied credit (stored in plan.credits)
-  */
+  /* ========= DYNAMIC PROGRESS APPLIER (and persist to cloud) ========= */
   useEffect(() => {
     if (!ready) return;
-
     const cur = plans[today] || { date: today, priorities: [], tasks: [], credits: {} as Record<string, number>, postponeFlags: {}, focusedCount: 0, focusedSessions: [] };
     const prevCredits = cur.credits || {};
 
-    // group today's tasks by goal
     const byGoal = new Map<string, Task[]>();
     for (const t of cur.tasks) {
       const arr = byGoal.get(t.goalId) || [];
@@ -673,45 +661,93 @@ export default function GoalsApp() {
       byGoal.set(t.goalId, arr);
     }
 
-    // compute new credits
     const nextCredits: Record<string, number> = {};
     byGoal.forEach((list, gid) => {
       const g = goals.find(x => x.id === gid);
       const weight = g?.dailyWeight ?? 5;
       const avg = Math.round(list.reduce((s, t) => s + t.percent, 0) / list.length); // 0..100
-      const delta = Math.round((avg / 100) * weight); // integer points
+      const delta = Math.round((avg / 100) * weight); // integer
       nextCredits[gid] = delta;
     });
-
-    // include goals that had previous credits but now no tasks → credit becomes 0
     Object.keys(prevCredits).forEach(gid => {
       if (!(gid in nextCredits)) nextCredits[gid] = 0;
     });
 
-    // detect changes
     const changed = (() => {
       const keys = new Set([...Object.keys(prevCredits), ...Object.keys(nextCredits)]);
       for (const k of keys) if ((prevCredits[k] || 0) !== (nextCredits[k] || 0)) return true;
       return false;
     })();
-
     if (!changed) return;
 
-    // apply diffs to goal.progress
-    setGoals(prev => prev.map(g => {
-      const before = prevCredits[g.id] || 0;
-      const after = nextCredits[g.id] || 0;
-      const diff = after - before;
-      if (diff === 0) return g;
-      return { ...g, progress: clamp(g.progress + diff, 0, 100), updatedAt: new Date().toISOString() };
-    }));
+    // apply goal progress diffs (and persist)
+    setGoals(prev => {
+      const updated = prev.map(g => {
+        const before = prevCredits[g.id] || 0;
+        const after  = nextCredits[g.id] || 0;
+        const diff = after - before;
+        if (diff === 0) return g;
+        const out = { ...g, progress: clamp(g.progress + diff, 0, 100), updatedAt: new Date().toISOString() };
+        persistGoal(out);
+        return out;
+      });
+      return updated;
+    });
 
-    // persist new credits
-    setPlans(prev => ({
-      ...prev,
-      [today]: { ...cur, credits: nextCredits }
-    }));
+    // persist plan credits change
+    updatePlanToday(cur2 => ({ ...cur2, credits: nextCredits }));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ready, plans, goals, today]);
+
+  /* ========= Live Firestore listeners (goals, today plan & meta) ========= */
+  useEffect(() => {
+    const u = auth.currentUser;
+    if (!u) return;
+
+    // Goals (live)
+    const goalsQ = query(collection(db, 'users', u.uid, 'goals'), orderBy('createdAt', 'desc'));
+    const unsubGoals = onSnapshot(goalsQ, (snap) => {
+      const arr = snap.docs.map(d => ({ id: d.id, ...(d.data() as unknown as Goal) }));
+      setGoals(arr);
+    });
+
+    // Today plan (live)
+    const unsubPlan = onSnapshot(doc(db, 'users', u.uid, 'plans', today), (snap) => {
+      const data = snap.data() as DayPlan | undefined;
+      if (data) setPlans(p => ({ ...p, [today]: data }));
+    });
+
+    // Today meta (live)
+    const unsubMeta = onSnapshot(doc(db, 'users', u.uid, 'meta', today), (snap) => {
+      const data = snap.data() as DayMeta | undefined;
+      if (data) setMeta(m => ({ ...m, [today]: data }));
+    });
+
+    return () => { unsubGoals(); unsubPlan(); unsubMeta(); };
+  }, [today]);
+
+  /* ========= Load plans for current calendar month (History) ========= */
+  const [calBase, setCalBase] = useState(() => { const d = new Date(); d.setDate(1); return d; });
+  const calYear = calBase.getFullYear();
+  const calMonth = calBase.getMonth();
+  const firstOfMonth = new Date(calYear, calMonth, 1);
+  const lastOfMonth = new Date(calYear, calMonth + 1, 0);
+
+  useEffect(() => {
+    const u = auth.currentUser; if (!u) return;
+    const startISO = yyyymmdd(firstOfMonth);
+    const endISO   = yyyymmdd(lastOfMonth);
+    const plansRef = collection(db, 'users', u.uid, 'plans');
+    const qy = query(plansRef, where('date','>=', startISO), where('date','<=', endISO));
+    getDocs(qy).then((snap) => {
+      const merged: Record<string, DayPlan> = {};
+      snap.forEach((d) => {
+        const data = d.data() as DayPlan;
+        merged[data.date] = data;
+      });
+      setPlans(prev => ({ ...prev, ...merged }));
+    }).catch(() => {});
+  }, [calYear, calMonth]); // when you flip months, fetch once
 
   /* ========= Stats / Widgets ========= */
   const todayByGoal = useMemo(() => {
@@ -726,14 +762,13 @@ export default function GoalsApp() {
   const prioritiesList = (planToday.priorities.map((id) => goals.find((g) => g.id === id)).filter(Boolean) as Goal[]);
   const nonPriorities = goals.filter((g) => !planToday.priorities.includes(g.id) && g.status === 'Active');
 
-  // --- Weekly goal-centric progress (Mon–Sun of the current week) ---
   const weekStats = useMemo(() => {
     const start = startOfWeek(today);
     const end = endOfWeek(today);
     const days = dateRange(start, end);
 
-    let actual = 0; // sum of deltas applied across all goals/days
-    let max = 0;    // sum of dailyWeight for goals that had tasks that day
+    let actual = 0;
+    let max = 0;
     const perGoalAgg = new Map<string, { title: string; actual: number; max: number }>();
 
     for (const day of days) {
@@ -750,7 +785,7 @@ export default function GoalsApp() {
       byGoal.forEach((list, gid) => {
         const g = goals.find((x) => x.id === gid);
         const weight = g?.dailyWeight ?? 5;
-        const avg = Math.round(list.reduce((s, t) => s + t.percent, 0) / list.length); // 0..100
+        const avg = Math.round(list.reduce((s, t) => s + t.percent, 0) / list.length);
         const delta = Math.round((avg / 100) * weight);
         actual += delta;
         max += weight;
@@ -780,7 +815,7 @@ export default function GoalsApp() {
   const dayStats = useMemo(() => {
     const total = todayTasks.length;
     const done = todayTasks.filter((t) => t.percent === 100).length;
-    const avg = total ? Math.round(todayTasks.reduce((s, t) => s + t.percent, 0) / total) : 0; // 0..100
+    const avg = total ? Math.round(todayTasks.reduce((s, t) => s + t.percent, 0) / total) : 0;
     return { total, done, avg };
   }, [todayTasks]);
 
@@ -789,13 +824,12 @@ export default function GoalsApp() {
       const list = todayByGoal.get(g.id) || [];
       const avg = list.length ? Math.round(list.reduce((s, t) => s + t.percent, 0) / list.length) : 0;
       const delta = Math.round((avg / 100) * (g.dailyWeight ?? 5));
-      const projected = clamp(g.progress, 0, 100); // progress is live-applied
+      const projected = clamp(g.progress, 0, 100); // progress is applied live
       return { goal: g, avg, delta, projected };
     });
   }, [prioritiesList, todayByGoal, goals]);
 
   const streak = useMemo(() => {
-    // consecutive days ending today where any task had percent > 0
     let c = 0;
     const d = new Date();
     for (;;) {
@@ -810,36 +844,32 @@ export default function GoalsApp() {
   /* ========= Reflection (auto-save) ========= */
   const metaToday = meta[today] || { date: today } as DayMeta;
   const setMetaField = <K extends keyof DayMeta>(key: K, value: DayMeta[K]) => {
-    setMeta(prev => ({ ...prev, [today]: { ...prev[today], date: today, [key]: value } as DayMeta }));
+    setMeta(prev => {
+      const next: DayMeta = { ...(prev[today] || { date: today }), date: today, [key]: value } as DayMeta;
+      const merged = { ...prev, [today]: next };
+      writeMetaToCloud(today, next);
+      return merged;
+    });
   };
 
   /* ========= History helpers ========= */
   const dayAverageFor = (isoDate: string) => {
     const pl = plans[isoDate];
-    if (!pl || pl.tasks.length === 0) return null; // null means "no data"
+    if (!pl || pl.tasks.length === 0) return null;
     const avg = Math.round(pl.tasks.reduce((s, t) => s + t.percent, 0) / pl.tasks.length);
-    return avg; // 0..100
+    return avg;
   };
 
-  const [calBase, setCalBase] = useState(() => {
-    const d = new Date();
-    d.setDate(1);
-    return d;
-  });
-  const calYear = calBase.getFullYear();
-  const calMonth = calBase.getMonth(); // 0..11
-  const firstOfMonth = new Date(calYear, calMonth, 1);
-  const lastOfMonth = new Date(calYear, calMonth + 1, 0);
+  const firstOfMonthState = new Date(calYear, calMonth, 1);
 
-  // Build a 6-week grid starting Monday
   const monthGrid = useMemo(() => {
-    const first = new Date(firstOfMonth);
+    const first = new Date(firstOfMonthState);
     const weekday = (first.getDay() + 6) % 7; // Mon=0
     const gridStart = new Date(first);
     gridStart.setDate(first.getDate() - weekday);
 
     const cells: { iso: string; inMonth: boolean; avg: number | null }[] = [];
-    for (let i = 0; i < 42; i++) { // 6 weeks
+    for (let i = 0; i < 42; i++) {
       const d = new Date(gridStart);
       d.setDate(gridStart.getDate() + i);
       const iso = yyyymmdd(d);
@@ -1091,7 +1121,6 @@ export default function GoalsApp() {
             </div>
           </div>
 
-          {/* Available goals */}
           <div className="space-y-2">
             <Label className="text-sm">Available goals</Label>
             <div className="flex flex-wrap gap-2">
@@ -1167,9 +1196,9 @@ export default function GoalsApp() {
       </Card>
 
       {/* Focused Session */}
-      <FocusPanel dateKey={today} plan={planToday} setPlans={setPlans} />
+      <FocusPanel dateKey={today} plan={planToday} updatePlan={updatePlanToday} />
 
-      {/* End of day — reflect & postpone (auto-saves; tasks auto-carry next day if checked) */}
+      {/* End of day — reflect & postpone (auto-saves; tasks auto-carry) */}
       <Card>
         <CardHeader><CardTitle>End of day — reflect & postpone</CardTitle></CardHeader>
         <CardContent className="space-y-4">
@@ -1188,11 +1217,7 @@ export default function GoalsApp() {
                         checked={checked}
                         onChange={(e)=> {
                           const flag = e.target.checked;
-                          setPlans(prev => {
-                            const cur = prev[today] || { date: today, priorities: [], tasks: [], credits: {}, postponeFlags: {}, focusedCount: 0, focusedSessions: [] };
-                            const nextFlags = { ...(cur.postponeFlags || {}) , [t.id]: flag };
-                            return { ...prev, [today]: { ...cur, postponeFlags: nextFlags } };
-                          });
+                          updatePlanToday(cur => ({ ...cur, postponeFlags: { ...(cur.postponeFlags || {}), [t.id]: flag } }));
                         }}
                       />
                       <span className="font-medium">{t.title}</span>
@@ -1204,7 +1229,6 @@ export default function GoalsApp() {
             </div>
           )}
 
-          {/* Reflection inputs (auto-save as you type) */}
           <div><Label>Why weren’t tasks completed?</Label>
             <Textarea
               rows={2}
