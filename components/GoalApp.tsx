@@ -224,6 +224,23 @@ function GoalModal({
             <Label>Short note — how & why</Label>
             <Textarea rows={3} value={note} onChange={(e)=>setNote(e.target.value)} placeholder="How will you do it? Why does it matter?" />
           </div>
+          
+          <div>
+            <Label>Priority</Label>
+            <div className="flex gap-2 mt-1">
+              {(['Low','Medium','High'] as const).map((p) => (
+                <Button
+                  key={p}
+                  variant={priority === p ? 'default' : 'outline'}
+                  size="sm"
+                  onClick={() => setPriority(p)}
+                >
+                  {p}
+                </Button>
+              ))}
+            </div>
+          </div>
+
           <div>
             <Label>Target date</Label>
             <Input type="date" value={targetDate} onChange={(e)=>setTargetDate(e.target.value)} />
