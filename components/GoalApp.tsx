@@ -29,6 +29,7 @@ import {
 /* ========= Types ========= */
 type Priority = 'Low' | 'Medium' | 'High';
 type GoalStatus = 'Active' | 'Paused' | 'Completed' | 'Dropped';
+type Tried = 'Yes' | 'No' | 'Neutral';
 
 interface Goal {
   id: string;
@@ -53,16 +54,26 @@ interface Task {
 }
 
 interface DayPlan {
-  date: string;             // YYYY-MM-DD
-  priorities: string[];     // ordered goalIds
-  tasks: Task[];            // today’s tasks
-  /** dynamic credits already applied to goal.progress for this date */
-  credits?: Record<string, number>; // goalId -> integer delta applied today
+  date: string;               // YYYY-MM-DD
+  priorities: string[];       // ordered goalIds
+  tasks: Task[];              // today’s tasks
+  credits?: Record<string, number>;        // goalId -> integer delta applied today
+  postponeFlags?: Record<string, boolean>; // taskId -> true if user chose to move to tomorrow
+  carriedFrom?: string;                    // last date we auto-carried from (e.g., yesterday)
+}
+
+interface DayMeta {
+  date: string;
+  learned?: string;
+  improve?: string;
+  triedWell?: Tried;
+  whyNotComplete?: string;
 }
 
 const NAME = 'Subhanshu';
 const LS_GOALS = 'goals_v3_longterm';
-const LS_PLANS = 'plans_v3_dynamic';
+const LS_PLANS = 'plans_v4_dynamic_postpone';
+const LS_META  = 'daymeta_v3_reflection';
 
 /* ========= Helpers ========= */
 const todayStr = () => new Date().toISOString().slice(0, 10);
@@ -71,6 +82,7 @@ const uid = () => Math.random().toString(36).slice(2, 10);
 const clamp = (n: number, min: number, max: number) => Math.min(Math.max(n, min), max);
 const step = (n: number, delta = 5) => clamp(Math.round((n + delta) / 5) * 5, 0, 100);
 const fmtDateLong = () => new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'short', day: 'numeric' });
+const yesterdayStr = () => { const d = new Date(); d.setDate(d.getDate()-1); return yyyymmdd(d); };
 
 /** Inclusive days left: 9→11 = 3, if past due returns 0 */
 const daysLeftInclusive = (fromISO: string, toISO: string): number => {
@@ -193,6 +205,7 @@ function GoalModal({
 export default function GoalsApp() {
   const [goals, setGoals] = useState<Goal[]>([]);
   const [plans, setPlans] = useState<Record<string, DayPlan>>({});
+  const [meta, setMeta]   = useState<Record<string, DayMeta>>({});
   const [ready, setReady] = useState(false);
 
   // modals
@@ -218,23 +231,64 @@ export default function GoalsApp() {
       },
     ]);
     const p = load<Record<string, DayPlan>>(LS_PLANS, {});
+    const m = load<Record<string, DayMeta>>(LS_META, {});
     setGoals(g);
     setPlans(p);
+    setMeta(m);
     setReady(true);
   }, []);
 
   /* ---- persistence ---- */
   useEffect(() => { if (ready) save(LS_GOALS, goals); }, [goals, ready]);
   useEffect(() => { if (ready) save(LS_PLANS, plans); }, [plans, ready]);
+  useEffect(() => { if (ready) save(LS_META, meta); }, [meta, ready]);
 
-  const planToday: DayPlan = plans[today] || { date: today, priorities: [], tasks: [], credits: {} };
+  /* ---- auto-carry postponed tasks from yesterday into today (runs once per day) ---- */
+  useEffect(() => {
+    if (!ready) return;
+    const y = yesterdayStr();
+    const yPlan = plans[y];
+    const tPlan = plans[today] || { date: today, priorities: [], tasks: [], credits: {}, postponeFlags: {} };
+
+    // Only carry once per day: use carriedFrom marker
+    if (!yPlan || tPlan.carriedFrom === y) return;
+
+    const flags = yPlan.postponeFlags || {};
+    const toMove = yPlan.tasks.filter(t => flags[t.id] && t.percent < 100);
+
+    if (toMove.length === 0) {
+      // mark carriedFrom anyway to avoid checking repeatedly
+      setPlans(prev => ({ ...prev, [today]: { ...tPlan, carriedFrom: y } }));
+      return;
+    }
+
+    // ensure priorities bring over those goalIds (keep existing order, then add missing)
+    const carryGoalIds = Array.from(new Set(toMove.map(t => t.goalId)));
+    const nextPriorities = [...tPlan.priorities];
+    for (const gid of carryGoalIds) if (!nextPriorities.includes(gid)) nextPriorities.push(gid);
+
+    // copy tasks into today at 0%
+    const copies: Task[] = toMove.map(t => ({ id: uid(), goalId: t.goalId, title: t.title, how: t.how, percent: 0 }));
+
+    setPlans(prev => ({
+      ...prev,
+      [today]: {
+        ...tPlan,
+        carriedFrom: y,
+        priorities: nextPriorities,
+        tasks: [...copies, ...tPlan.tasks],
+      }
+    }));
+  }, [ready, plans, today]);
+
+  const planToday: DayPlan = plans[today] || { date: today, priorities: [], tasks: [], credits: {}, postponeFlags: {} };
   const todayTasks = planToday.tasks;
 
   /* ========= Goal CRUD ========= */
   const addGoal = (g: Goal) => setGoals(prev => [g, ...prev]);
   const removeGoal = (id: string) => {
     setGoals(prev => prev.filter(x=>x.id!==id));
-    // also strip from priorities/tasks for cleanliness
+    // also strip from today's plan for cleanliness
     setPlans(prev => {
       const cur = prev[today];
       if (!cur) return prev;
@@ -254,20 +308,20 @@ export default function GoalsApp() {
   /* ========= Morning Planner ========= */
   const addPriority = (goalId: string) => {
     setPlans((prev) => {
-      const cur = prev[today] || { date: today, priorities: [], tasks: [], credits: {} };
+      const cur = prev[today] || { date: today, priorities: [], tasks: [], credits: {}, postponeFlags: {} };
       if (cur.priorities.includes(goalId)) return prev;
       return { ...prev, [today]: { ...cur, priorities: [...cur.priorities, goalId] } };
     });
   };
   const removePriority = (goalId: string) => {
     setPlans((prev) => {
-      const cur = prev[today] || { date: today, priorities: [], tasks: [], credits: {} };
+      const cur = prev[today] || { date: today, priorities: [], tasks: [], credits: {}, postponeFlags: {} };
       return { ...prev, [today]: { ...cur, priorities: cur.priorities.filter((g) => g !== goalId) } };
     });
   };
   const movePriority = (goalId: string, dir: 'up' | 'down') => {
     setPlans((prev) => {
-      const cur = prev[today] || { date: today, priorities: [], tasks: [], credits: {} };
+      const cur = prev[today] || { date: today, priorities: [], tasks: [], credits: {}, postponeFlags: {} };
       const idx = cur.priorities.indexOf(goalId);
       if (idx === -1) return prev;
       const to = dir === 'up' ? idx - 1 : idx + 1;
@@ -281,7 +335,7 @@ export default function GoalsApp() {
   const addTask = (goalId: string, title: string, how?: string) => {
     if (!title.trim()) return;
     setPlans((prev) => {
-      const cur = prev[today] || { date: today, priorities: [], tasks: [], credits: {} };
+      const cur = prev[today] || { date: today, priorities: [], tasks: [], credits: {}, postponeFlags: {} };
       const t: Task = { id: uid(), goalId, title: title.trim(), how, percent: 0 };
       return { ...prev, [today]: { ...cur, tasks: [t, ...cur.tasks] } };
     });
@@ -290,7 +344,8 @@ export default function GoalsApp() {
     setPlans((prev) => {
       const cur = prev[today]; if (!cur) return prev;
       const newTasks = cur.tasks.filter((t) => t.id !== taskId);
-      return { ...prev, [today]: { ...cur, tasks: newTasks } };
+      const { [taskId]: _omit, ...restFlags } = cur.postponeFlags || {};
+      return { ...prev, [today]: { ...cur, tasks: newTasks, postponeFlags: restFlags } };
     });
   };
 
@@ -328,7 +383,7 @@ export default function GoalsApp() {
   useEffect(() => {
     if (!ready) return;
 
-    const cur = plans[today] || { date: today, priorities: [], tasks: [], credits: {} as Record<string, number> };
+    const cur = plans[today] || { date: today, priorities: [], tasks: [], credits: {} as Record<string, number>, postponeFlags: {} };
     const prevCredits = cur.credits || {};
 
     // group today's tasks by goal
@@ -443,7 +498,7 @@ export default function GoalsApp() {
       byGoal.forEach((list, gid) => {
         const g = goals.find((x) => x.id === gid);
         const weight = g?.dailyWeight ?? 5;
-        const avg = Math.round(list.reduce((s, t) => s + t.percent, 0) / list.length); // 0..100
+        the const avg = Math.round(list.reduce((s, t) => s + t.percent, 0) / list.length); // 0..100
         const delta = Math.round((avg / 100) * weight);
         actual += delta;
         max += weight;
@@ -499,6 +554,12 @@ export default function GoalsApp() {
     }
     return c;
   }, [plans]);
+
+  /* ========= Reflection state (auto-saved) ========= */
+  const metaToday = meta[today] || { date: today } as DayMeta;
+  const setMetaField = <K extends keyof DayMeta>(key: K, value: DayMeta[K]) => {
+    setMeta(prev => ({ ...prev, [today]: { ...prev[today], date: today, [key]: value } as DayMeta }));
+  };
 
   /* ========= Render ========= */
   return (
@@ -805,6 +866,89 @@ export default function GoalsApp() {
             );
           })}
           {planToday.priorities.length === 0 && <div className="text-xs text-muted-foreground">No priorities selected.</div>}
+        </CardContent>
+      </Card>
+
+      {/* End of day — reflect & postpone (NO button; auto-saves & auto-carries next day) */}
+      <Card>
+        <CardHeader><CardTitle>End of day — reflect & postpone</CardTitle></CardHeader>
+        <CardContent className="space-y-4">
+          {/* Incomplete tasks → choose Postpone */}
+          {todayTasks.some(t=>t.percent<100) && (
+            <div className="rounded-md border p-3">
+              <div className="text-sm font-medium mb-2">Incomplete today — move to tomorrow?</div>
+              <div className="space-y-2">
+                {todayTasks.filter(t=>t.percent<100).map(t => {
+                  const g = goals.find(x=>x.id===t.goalId);
+                  const checked = !!(planToday.postponeFlags && planToday.postponeFlags[t.id]);
+                  return (
+                    <label key={t.id} className="flex items-center gap-2 text-sm">
+                      <input
+                        type="checkbox"
+                        className="h-4 w-4"
+                        checked={checked}
+                        onChange={(e)=> {
+                          const flag = e.target.checked;
+                          setPlans(prev => {
+                            const cur = prev[today] || { date: today, priorities: [], tasks: [], credits: {}, postponeFlags: {} };
+                            const nextFlags = { ...(cur.postponeFlags || {}) , [t.id]: flag };
+                            return { ...prev, [today]: { ...cur, postponeFlags: nextFlags } };
+                          });
+                        }}
+                      />
+                      <span className="font-medium">{t.title}</span>
+                      <span className="text-xs text-muted-foreground">({g?.title})</span>
+                    </label>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Reflection inputs (auto-save as you type) */}
+          <div><Label>Why weren’t tasks completed?</Label>
+            <Textarea
+              rows={2}
+              value={metaToday.whyNotComplete || ''}
+              onChange={(e) => setMetaField('whyNotComplete', e.target.value)}
+              placeholder="Be specific—what blocked you?"
+            />
+          </div>
+
+          <div><Label>Did you really try well?</Label>
+            <div className="flex gap-2 mt-1">
+              {(['Yes', 'No', 'Neutral'] as const).map((k) => (
+                <Button
+                  key={k}
+                  variant={metaToday.triedWell === k ? 'default' : 'outline'}
+                  size="sm"
+                  onClick={() => setMetaField('triedWell', k)}
+                >
+                  {k}
+                </Button>
+              ))}
+            </div>
+          </div>
+
+          <div><Label>How will you improve tomorrow?</Label>
+            <Textarea
+              rows={2}
+              value={metaToday.improve || ''}
+              onChange={(e) => setMetaField('improve', e.target.value)}
+            />
+          </div>
+
+          <div><Label>What did you learn today?</Label>
+            <Textarea
+              rows={2}
+              value={metaToday.learned || ''}
+              onChange={(e) => setMetaField('learned', e.target.value)}
+            />
+          </div>
+
+          <div className="text-xs text-muted-foreground">
+            Notes auto-saved • Postponed tasks move into tomorrow automatically.
+          </div>
         </CardContent>
       </Card>
 
