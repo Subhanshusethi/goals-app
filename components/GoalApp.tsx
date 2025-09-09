@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState, useRef } from 'react';
 import {
   Card, CardContent, CardHeader, CardTitle,
 } from '@/components/ui/card';
@@ -24,6 +24,8 @@ import {
   SquarePlus,
   Trash2,
   User,
+  Timer as TimerIcon,
+  History as HistoryIcon,
 } from 'lucide-react';
 
 /* ========= Types ========= */
@@ -53,13 +55,24 @@ interface Task {
   percent: number;         // 0..100 (we step by 5 via +/-)
 }
 
+interface FocusSession {
+  id: string;
+  startISO: string;
+  endISO: string;
+  durationMin: number;
+  acknowledgedAt: string[]; // ISO timestamps for each 15-min ack
+  status: 'completed' | 'failed' | 'canceled';
+}
+
 interface DayPlan {
-  date: string;               // YYYY-MM-DD
-  priorities: string[];       // ordered goalIds
-  tasks: Task[];              // today’s tasks
-  credits?: Record<string, number>;        // goalId -> integer delta applied today
+  date: string;                         // YYYY-MM-DD
+  priorities: string[];                 // ordered goalIds
+  tasks: Task[];                        // today’s tasks
+  credits?: Record<string, number>;     // goalId -> integer delta applied today
   postponeFlags?: Record<string, boolean>; // taskId -> true if user chose to move to tomorrow
-  carriedFrom?: string;                    // last date we auto-carried from (e.g., yesterday)
+  carriedFrom?: string;                 // last date we auto-carried from (e.g., yesterday)
+  focusedCount?: number;                // completed focused sessions today
+  focusedSessions?: FocusSession[];     // log of focus sessions for this date
 }
 
 interface DayMeta {
@@ -72,7 +85,7 @@ interface DayMeta {
 
 const NAME = 'Subhanshu';
 const LS_GOALS = 'goals_v3_longterm';
-const LS_PLANS = 'plans_v4_dynamic_postpone';
+const LS_PLANS = 'plans_v5_focus_history';
 const LS_META  = 'daymeta_v3_reflection';
 
 /* ========= Helpers ========= */
@@ -122,7 +135,31 @@ const load = <T,>(key: string, fallback: T): T => {
 };
 const save = (key: string, value: unknown) => localStorage.setItem(key, JSON.stringify(value));
 
-/* ========= Pretty Ring (Today %) ========= */
+/* ========= Week / Calendar helpers ========= */
+// ISO week starting Monday
+const startOfWeek = (isoDate: string) => {
+  const d = new Date(isoDate + 'T00:00:00');
+  const weekday = (d.getDay() + 6) % 7; // Mon=0…Sun=6
+  d.setDate(d.getDate() - weekday);
+  return yyyymmdd(d);
+};
+const endOfWeek = (isoDate: string) => {
+  const s = new Date(startOfWeek(isoDate) + 'T00:00:00');
+  s.setDate(s.getDate() + 6);
+  return yyyymmdd(s);
+};
+const dateRange = (start: string, end: string) => {
+  const out: string[] = [];
+  const d = new Date(start + 'T00:00:00');
+  const e = new Date(end + 'T00:00:00');
+  while (d <= e) {
+    out.push(yyyymmdd(d));
+    d.setDate(d.getDate() + 1);
+  }
+  return out;
+};
+
+/* ========= Pretty Ring (percentage) ========= */
 function Ring({ value, size = 72 }: { value: number; size?: number }) {
   const pct = clamp(Math.round(value), 0, 100);
   const bg = `conic-gradient(hsl(var(--primary)) ${pct}%, hsl(var(--muted-foreground)/.15) ${pct}%)`;
@@ -201,6 +238,230 @@ function GoalModal({
   );
 }
 
+/* ========= Focused Session Panel ========= */
+function FocusPanel({
+  dateKey, plan, setPlans,
+}: {
+  dateKey: string;
+  plan: DayPlan;
+  setPlans: React.Dispatch<React.SetStateAction<Record<string, DayPlan>>>;
+}) {
+  const [durationMin, setDurationMin] = useState<number>(30);
+  const [running, setRunning] = useState(false);
+  const [remainingSec, setRemainingSec] = useState(0);
+  const [needsAck, setNeedsAck] = useState(false);
+  const [ackDeadline, setAckDeadline] = useState<number | null>(null);
+  const [nextAckAt, setNextAckAt] = useState<number | null>(null);
+  const [ackTimes, setAckTimes] = useState<string[]>([]);
+  const startTimeRef = useRef<number | null>(null);
+  const tickRef = useRef<number | null>(null);
+
+  // cleanup
+  useEffect(() => () => { if (tickRef.current) window.clearInterval(tickRef.current); }, []);
+
+  const recordSession = (status: FocusSession['status']) => {
+    const startISO = startTimeRef.current ? new Date(startTimeRef.current).toISOString() : new Date().toISOString();
+    const endISO = new Date().toISOString();
+    const session: FocusSession = {
+      id: uid(),
+      startISO,
+      endISO,
+      durationMin,
+      acknowledgedAt: [...ackTimes],
+      status,
+    };
+    setPlans(prev => {
+      const cur = prev[dateKey] || { date: dateKey, priorities: [], tasks: [] };
+      const fc = cur.focusedCount ?? 0;
+      const list = cur.focusedSessions ?? [];
+      let nextFocusedCount = fc;
+      let nextList = list;
+
+      if (status === 'completed') {
+        nextFocusedCount = fc + 1;
+        nextList = [session, ...list];
+      } else if (status === 'failed') {
+        // per requirement: reset to 0 and discard sessions
+        nextFocusedCount = 0;
+        nextList = [];
+      } else {
+        // canceled: keep existing, just log it (optional: comment out to ignore canceled)
+        nextList = [session, ...list];
+      }
+      return { ...prev, [dateKey]: { ...cur, focusedCount: nextFocusedCount, focusedSessions: nextList } };
+    });
+  };
+
+  const stopTimer = (status: FocusSession['status']) => {
+    if (tickRef.current) window.clearInterval(tickRef.current);
+    tickRef.current = null;
+    setRunning(false);
+    setNeedsAck(false);
+    setAckDeadline(null);
+    setNextAckAt(null);
+    startTimeRef.current = null;
+    setRemainingSec(0);
+    recordSession(status);
+    setAckTimes([]);
+  };
+
+  const startTimer = () => {
+    const dur = Math.max(30, Math.round(durationMin)); // enforce 30 min minimum
+    const now = Date.now();
+    startTimeRef.current = now;
+    const total = dur * 60;
+    setRemainingSec(total);
+    setRunning(true);
+    setNeedsAck(false);
+    setAckDeadline(null);
+    setAckTimes([]);
+    setNextAckAt(now + 15 * 60 * 1000); // first ack after 15 min
+
+    if (tickRef.current) window.clearInterval(tickRef.current);
+    tickRef.current = window.setInterval(() => {
+      setRemainingSec((old) => {
+        const newVal = old - 1;
+        return newVal >= 0 ? newVal : 0;
+      });
+
+      const t = Date.now();
+
+      // trigger ack requirement
+      setNextAckAt((na) => {
+        if (!na) return na;
+        if (t >= na && !needsAck) {
+          setNeedsAck(true);
+          setAckDeadline(t + 60 * 1000); // 60s grace
+        }
+        return na;
+      });
+
+      // check ack timeout
+      setAckDeadline((dl) => {
+        if (dl && needsAck && t > dl) {
+          // failed: missed acknowledgement
+          stopTimer('failed');
+          return null;
+        }
+        return dl;
+      });
+
+      // finish timer
+      setRemainingSec((val) => {
+        if (val <= 1 && running) {
+          // finishing now
+          // must not be waiting for ack
+          if (!needsAck) {
+            stopTimer('completed');
+          } else {
+            // if timer ends while ack pending, treat as fail
+            stopTimer('failed');
+          }
+        }
+        return val;
+      });
+    }, 1000) as unknown as number;
+  };
+
+  const acknowledge = () => {
+    if (!needsAck) return;
+    setNeedsAck(false);
+    setAckDeadline(null);
+    setAckTimes((arr) => [...arr, new Date().toISOString()]);
+    // schedule next 15-min checkpoint
+    setNextAckAt(Date.now() + 15 * 60 * 1000);
+  };
+
+  const cancel = () => {
+    if (!running) return;
+    stopTimer('canceled');
+  };
+
+  const mins = Math.floor(remainingSec / 60);
+  const secs = remainingSec % 60;
+  const totalSec = Math.max(1, Math.max(30, Math.round(durationMin)) * 60);
+  const pct = running ? Math.round(((totalSec - remainingSec) / totalSec) * 100) : 0;
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <TimerIcon className="h-5 w-5" />
+          Focused session
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {!running ? (
+          <div className="flex items-end gap-3">
+            <div className="flex items-center gap-2">
+              <Label>Duration (min, ≥30)</Label>
+              <Input
+                type="number"
+                className="w-28"
+                min={30}
+                value={durationMin}
+                onChange={(e)=> setDurationMin(Number(e.target.value))}
+              />
+            </div>
+            <div className="flex gap-2">
+              {[30, 45, 60].map(v => (
+                <Button key={v} variant={durationMin===v?'default':'outline'} size="sm" onClick={()=>setDurationMin(v)}>{v}m</Button>
+              ))}
+            </div>
+            <div className="flex-1" />
+            <Button onClick={startTimer}><TimerIcon className="h-4 w-4 mr-1" />Start</Button>
+          </div>
+        ) : (
+          <div className="space-y-3">
+            <div className="flex items-center gap-4">
+              <Ring value={pct} size={84} />
+              <div className="text-3xl font-semibold tabular-nums">
+                {String(mins).padStart(2,'0')}:{String(secs).padStart(2,'0')}
+              </div>
+              <div className="flex-1" />
+              <Button variant="destructive" onClick={cancel}>Cancel</Button>
+            </div>
+            {needsAck ? (
+              <div className="p-3 rounded-md border border-red-300 bg-red-50 dark:bg-red-950/20">
+                <div className="text-sm font-medium text-red-600 dark:text-red-400">Acknowledge to keep the session!</div>
+                <div className="text-xs text-muted-foreground mb-2">If you don’t acknowledge within ~60s, this session will fail and your today count resets to 0.</div>
+                <Button onClick={acknowledge}><CheckCircle2 className="h-4 w-4 mr-1" />Acknowledge</Button>
+              </div>
+            ) : (
+              <div className="text-xs text-muted-foreground">Next checkpoint in 15 minutes… stay focused.</div>
+            )}
+          </div>
+        )}
+
+        <Separator />
+
+        <div className="grid grid-cols-3 gap-3">
+          <div className="p-3 rounded-lg border">
+            <div className="text-xs text-muted-foreground">Focused sessions today</div>
+            <div className="text-xl font-semibold">{plan.focusedCount ?? 0}</div>
+          </div>
+          <div className="p-3 rounded-lg border col-span-2">
+            <div className="text-xs text-muted-foreground mb-2">Recent sessions</div>
+            {(plan.focusedSessions?.length ?? 0) === 0 && (
+              <div className="text-xs text-muted-foreground">No sessions yet today.</div>
+            )}
+            <div className="space-y-1 max-h-28 overflow-auto">
+              {(plan.focusedSessions ?? []).slice(0,5).map(s => (
+                <div key={s.id} className="text-xs flex items-center justify-between">
+                  <span>{new Date(s.startISO).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})} → {new Date(s.endISO).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</span>
+                  <span className={`px-2 py-0.5 rounded-full ${s.status==='completed'?'bg-green-200 text-green-900 dark:bg-green-900/40 dark:text-green-300':'bg-red-200 text-red-900 dark:bg-red-900/40 dark:text-red-300'}`}>
+                    {s.status} • {s.durationMin}m
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
 /* ========= Main App ========= */
 export default function GoalsApp() {
   const [goals, setGoals] = useState<Goal[]>([]);
@@ -210,6 +471,10 @@ export default function GoalsApp() {
 
   // modals
   const [goalOpen, setGoalOpen] = useState(false);
+
+  // history modal
+  const [histOpen, setHistOpen] = useState(false);
+  const [histDate, setHistDate] = useState<string | null>(null);
 
   const today = todayStr();
 
@@ -248,26 +513,22 @@ export default function GoalsApp() {
     if (!ready) return;
     const y = yesterdayStr();
     const yPlan = plans[y];
-    const tPlan = plans[today] || { date: today, priorities: [], tasks: [], credits: {}, postponeFlags: {} };
+    const tPlan = plans[today] || { date: today, priorities: [], tasks: [], credits: {}, postponeFlags: {}, focusedCount: 0, focusedSessions: [] };
 
-    // Only carry once per day: use carriedFrom marker
-    if (!yPlan || tPlan.carriedFrom === y) return;
+    if (tPlan.carriedFrom === y) return;
+
+    if (!yPlan) {
+      setPlans(prev => ({ ...prev, [today]: { ...tPlan, carriedFrom: y, focusedCount: tPlan.focusedCount ?? 0, focusedSessions: tPlan.focusedSessions ?? [] } }));
+      return;
+    }
 
     const flags = yPlan.postponeFlags || {};
     const toMove = yPlan.tasks.filter(t => flags[t.id] && t.percent < 100);
 
-    if (toMove.length === 0) {
-      // mark carriedFrom anyway to avoid checking repeatedly
-      setPlans(prev => ({ ...prev, [today]: { ...tPlan, carriedFrom: y } }));
-      return;
-    }
-
-    // ensure priorities bring over those goalIds (keep existing order, then add missing)
     const carryGoalIds = Array.from(new Set(toMove.map(t => t.goalId)));
     const nextPriorities = [...tPlan.priorities];
     for (const gid of carryGoalIds) if (!nextPriorities.includes(gid)) nextPriorities.push(gid);
 
-    // copy tasks into today at 0%
     const copies: Task[] = toMove.map(t => ({ id: uid(), goalId: t.goalId, title: t.title, how: t.how, percent: 0 }));
 
     setPlans(prev => ({
@@ -277,11 +538,13 @@ export default function GoalsApp() {
         carriedFrom: y,
         priorities: nextPriorities,
         tasks: [...copies, ...tPlan.tasks],
+        focusedCount: tPlan.focusedCount ?? 0,
+        focusedSessions: tPlan.focusedSessions ?? [],
       }
     }));
   }, [ready, plans, today]);
 
-  const planToday: DayPlan = plans[today] || { date: today, priorities: [], tasks: [], credits: {}, postponeFlags: {} };
+  const planToday: DayPlan = plans[today] || { date: today, priorities: [], tasks: [], credits: {}, postponeFlags: {}, focusedCount: 0, focusedSessions: [] };
   const todayTasks = planToday.tasks;
 
   /* ========= Goal CRUD ========= */
@@ -308,20 +571,20 @@ export default function GoalsApp() {
   /* ========= Morning Planner ========= */
   const addPriority = (goalId: string) => {
     setPlans((prev) => {
-      const cur = prev[today] || { date: today, priorities: [], tasks: [], credits: {}, postponeFlags: {} };
+      const cur = prev[today] || { date: today, priorities: [], tasks: [], credits: {}, postponeFlags: {}, focusedCount: 0, focusedSessions: [] };
       if (cur.priorities.includes(goalId)) return prev;
       return { ...prev, [today]: { ...cur, priorities: [...cur.priorities, goalId] } };
     });
   };
   const removePriority = (goalId: string) => {
     setPlans((prev) => {
-      const cur = prev[today] || { date: today, priorities: [], tasks: [], credits: {}, postponeFlags: {} };
+      const cur = prev[today] || { date: today, priorities: [], tasks: [], credits: {}, postponeFlags: {}, focusedCount: 0, focusedSessions: [] };
       return { ...prev, [today]: { ...cur, priorities: cur.priorities.filter((g) => g !== goalId) } };
     });
   };
   const movePriority = (goalId: string, dir: 'up' | 'down') => {
     setPlans((prev) => {
-      const cur = prev[today] || { date: today, priorities: [], tasks: [], credits: {}, postponeFlags: {} };
+      const cur = prev[today] || { date: today, priorities: [], tasks: [], credits: {}, postponeFlags: {}, focusedCount: 0, focusedSessions: [] };
       const idx = cur.priorities.indexOf(goalId);
       if (idx === -1) return prev;
       const to = dir === 'up' ? idx - 1 : idx + 1;
@@ -335,7 +598,7 @@ export default function GoalsApp() {
   const addTask = (goalId: string, title: string, how?: string) => {
     if (!title.trim()) return;
     setPlans((prev) => {
-      const cur = prev[today] || { date: today, priorities: [], tasks: [], credits: {}, postponeFlags: {} };
+      const cur = prev[today] || { date: today, priorities: [], tasks: [], credits: {}, postponeFlags: {}, focusedCount: 0, focusedSessions: [] };
       const t: Task = { id: uid(), goalId, title: title.trim(), how, percent: 0 };
       return { ...prev, [today]: { ...cur, tasks: [t, ...cur.tasks] } };
     });
@@ -375,15 +638,14 @@ export default function GoalsApp() {
     });
   };
 
-  /* ========= DYNAMIC PROGRESS APPLIER (no "Close day") =========
+  /* ========= DYNAMIC PROGRESS APPLIER =========
      - Computes per-goal credit = round(avg(today)% * dailyWeight / 100)
      - Applies ONLY the difference from last applied credit (stored in plan.credits)
-     - This avoids double-counting when you tweak tasks.
   */
   useEffect(() => {
     if (!ready) return;
 
-    const cur = plans[today] || { date: today, priorities: [], tasks: [], credits: {} as Record<string, number>, postponeFlags: {} };
+    const cur = plans[today] || { date: today, priorities: [], tasks: [], credits: {} as Record<string, number>, postponeFlags: {}, focusedCount: 0, focusedSessions: [] };
     const prevCredits = cur.credits || {};
 
     // group today's tasks by goal
@@ -404,12 +666,12 @@ export default function GoalsApp() {
       nextCredits[gid] = delta;
     });
 
-    // include any goals that had previous credits but now no tasks → credit becomes 0
+    // include goals that had previous credits but now no tasks → credit becomes 0
     Object.keys(prevCredits).forEach(gid => {
       if (!(gid in nextCredits)) nextCredits[gid] = 0;
     });
 
-    // check if credits actually changed
+    // detect changes
     const changed = (() => {
       const keys = new Set([...Object.keys(prevCredits), ...Object.keys(nextCredits)]);
       for (const k of keys) if ((prevCredits[k] || 0) !== (nextCredits[k] || 0)) return true;
@@ -447,29 +709,6 @@ export default function GoalsApp() {
   const prioritiesList = (planToday.priorities.map((id) => goals.find((g) => g.id === id)).filter(Boolean) as Goal[]);
   const nonPriorities = goals.filter((g) => !planToday.priorities.includes(g.id) && g.status === 'Active');
 
-  // Week helpers: ISO week starting Monday
-  const startOfWeek = (isoDate: string) => {
-    const d = new Date(isoDate + 'T00:00:00');
-    const weekday = (d.getDay() + 6) % 7; // Mon=0…Sun=6
-    d.setDate(d.getDate() - weekday);
-    return yyyymmdd(d);
-  };
-  const endOfWeek = (isoDate: string) => {
-    const s = new Date(startOfWeek(isoDate) + 'T00:00:00');
-    s.setDate(s.getDate() + 6);
-    return yyyymmdd(s);
-  };
-  const dateRange = (start: string, end: string) => {
-    const out: string[] = [];
-    const d = new Date(start + 'T00:00:00');
-    const e = new Date(end + 'T00:00:00');
-    while (d <= e) {
-      out.push(yyyymmdd(d));
-      d.setDate(d.getDate() + 1);
-    }
-    return out;
-  };
-
   // --- Weekly goal-centric progress (Mon–Sun of the current week) ---
   const weekStats = useMemo(() => {
     const start = startOfWeek(today);
@@ -478,15 +717,12 @@ export default function GoalsApp() {
 
     let actual = 0; // sum of deltas applied across all goals/days
     let max = 0;    // sum of dailyWeight for goals that had tasks that day
-
-    // aggregate per-goal for the week (for mini bars)
     const perGoalAgg = new Map<string, { title: string; actual: number; max: number }>();
 
     for (const day of days) {
       const dayPlan = plans[day];
       if (!dayPlan || dayPlan.tasks.length === 0) continue;
 
-      // group tasks by goal for that day
       const byGoal = new Map<string, Task[]>();
       for (const t of dayPlan.tasks) {
         const arr = byGoal.get(t.goalId) || [];
@@ -494,7 +730,6 @@ export default function GoalsApp() {
         byGoal.set(t.goalId, arr);
       }
 
-      // compute delta per goal for that day
       byGoal.forEach((list, gid) => {
         const g = goals.find((x) => x.id === gid);
         const weight = g?.dailyWeight ?? 5;
@@ -537,7 +772,7 @@ export default function GoalsApp() {
       const list = todayByGoal.get(g.id) || [];
       const avg = list.length ? Math.round(list.reduce((s, t) => s + t.percent, 0) / list.length) : 0;
       const delta = Math.round((avg / 100) * (g.dailyWeight ?? 5));
-      const projected = clamp(g.progress, 0, 100); // already applied live
+      const projected = clamp(g.progress, 0, 100); // progress is live-applied
       return { goal: g, avg, delta, projected };
     });
   }, [prioritiesList, todayByGoal, goals]);
@@ -555,10 +790,55 @@ export default function GoalsApp() {
     return c;
   }, [plans]);
 
-  /* ========= Reflection state (auto-saved) ========= */
+  /* ========= Reflection (auto-save) ========= */
   const metaToday = meta[today] || { date: today } as DayMeta;
   const setMetaField = <K extends keyof DayMeta>(key: K, value: DayMeta[K]) => {
     setMeta(prev => ({ ...prev, [today]: { ...prev[today], date: today, [key]: value } as DayMeta }));
+  };
+
+  /* ========= History helpers ========= */
+  const dayAverageFor = (isoDate: string) => {
+    const pl = plans[isoDate];
+    if (!pl || pl.tasks.length === 0) return null; // null means "no data"
+    const avg = Math.round(pl.tasks.reduce((s, t) => s + t.percent, 0) / pl.tasks.length);
+    return avg; // 0..100
+  };
+
+  const [calBase, setCalBase] = useState(() => {
+    const d = new Date();
+    d.setDate(1);
+    return d;
+  });
+  const calYear = calBase.getFullYear();
+  const calMonth = calBase.getMonth(); // 0..11
+  const firstOfMonth = new Date(calYear, calMonth, 1);
+  const lastOfMonth = new Date(calYear, calMonth + 1, 0);
+
+  // Build a 6-week grid starting Monday
+  const monthGrid = useMemo(() => {
+    const first = new Date(firstOfMonth);
+    const weekday = (first.getDay() + 6) % 7; // Mon=0
+    const gridStart = new Date(first);
+    gridStart.setDate(first.getDate() - weekday);
+
+    const cells: { iso: string; inMonth: boolean; avg: number | null }[] = [];
+    for (let i = 0; i < 42; i++) { // 6 weeks
+      const d = new Date(gridStart);
+      d.setDate(gridStart.getDate() + i);
+      const iso = yyyymmdd(d);
+      const inMonth = d.getMonth() === calMonth;
+      const avg = dayAverageFor(iso);
+      cells.push({ iso, inMonth, avg });
+    }
+    return cells;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [plans, calYear, calMonth]);
+
+  const colorForAvg = (avg: number | null) => {
+    if (avg === null) return 'bg-muted';
+    if (avg > 70) return 'bg-green-500/80 text-white';
+    if (avg > 50) return 'bg-yellow-400/80 text-black';
+    return 'bg-red-500/80 text-white';
   };
 
   /* ========= Render ========= */
@@ -594,8 +874,8 @@ export default function GoalsApp() {
             </div>
           </CardTitle>
         </CardHeader>
-        <CardContent className="grid gap-4 md:grid-cols-4 items-center">
-          <div className="flex items-center gap-4">
+        <CardContent className="grid gap-4 md:grid-cols-5 items-center">
+          <div className="flex items-center gap-4 md:col-span-2">
             <Ring value={dayStats.avg} />
             <div>
               <div className="text-sm text-muted-foreground">Today completion</div>
@@ -611,8 +891,12 @@ export default function GoalsApp() {
             <div className="text-xs text-muted-foreground">Done</div>
             <div className="text-xl font-semibold">{dayStats.done}</div>
           </div>
+          <div className="p-3 rounded-lg border">
+            <div className="text-xs text-muted-foreground">Focused sessions</div>
+            <div className="text-xl font-semibold">{planToday.focusedCount ?? 0}</div>
+          </div>
 
-          <div className="md:col-span-4">
+          <div className="md:col-span-5">
             <div className="flex justify-between text-xs mb-1 text-muted-foreground">
               <span>Day progress</span><span>{dayStats.avg}%</span>
             </div>
@@ -683,7 +967,6 @@ export default function GoalsApp() {
             const weight = g.dailyWeight ?? 5;
             const reqAvg = requiredAvgWithCurrentWeight(remaining, daysLeft, weight);
 
-            // simple heuristic for suggestion (fallback 70%)
             const typical = 70;
             const suggestedW = suggestedWeightToHit(remaining, daysLeft, typical);
             const impossibleWithCurrent = daysLeft > 0 && reqAvg > 100;
@@ -706,7 +989,6 @@ export default function GoalsApp() {
                   <Progress value={g.progress} />
                 </div>
 
-                {/* Deadline helper */}
                 <div className="mt-3 p-2 rounded-md border">
                   {remaining <= 0 ? (
                     <div className="text-xs text-muted-foreground">Goal completed 🎉</div>
@@ -763,7 +1045,6 @@ export default function GoalsApp() {
       <Card>
         <CardHeader><CardTitle>Morning plan — pick goals & tasks</CardTitle></CardHeader>
         <CardContent className="space-y-4">
-          {/* Selected priorities in order */}
           <div className="space-y-2">
             <Label className="text-sm">Today’s priorities (top to bottom)</Label>
             {planToday.priorities.length === 0 && <div className="text-xs text-muted-foreground">Pick from “Available goals” below.</div>}
@@ -771,7 +1052,6 @@ export default function GoalsApp() {
               {planToday.priorities.map((gid, idx) => {
                 const g = goals.find(x=>x.id===gid);
                 if (!g) return null;
-                // Tiny hint: today's required avg with current weight
                 const daysLeft = daysLeftInclusive(today, g.targetDate);
                 const remaining = clamp(100 - g.progress, 0, 100);
                 const reqAvgToday = requiredAvgWithCurrentWeight(remaining, daysLeft, g.dailyWeight ?? 5);
@@ -869,11 +1149,13 @@ export default function GoalsApp() {
         </CardContent>
       </Card>
 
-      {/* End of day — reflect & postpone (NO button; auto-saves & auto-carries next day) */}
+      {/* Focused Session */}
+      <FocusPanel dateKey={today} plan={planToday} setPlans={setPlans} />
+
+      {/* End of day — reflect & postpone (auto-saves; tasks auto-carry next day if checked) */}
       <Card>
         <CardHeader><CardTitle>End of day — reflect & postpone</CardTitle></CardHeader>
         <CardContent className="space-y-4">
-          {/* Incomplete tasks → choose Postpone */}
           {todayTasks.some(t=>t.percent<100) && (
             <div className="rounded-md border p-3">
               <div className="text-sm font-medium mb-2">Incomplete today — move to tomorrow?</div>
@@ -890,7 +1172,7 @@ export default function GoalsApp() {
                         onChange={(e)=> {
                           const flag = e.target.checked;
                           setPlans(prev => {
-                            const cur = prev[today] || { date: today, priorities: [], tasks: [], credits: {}, postponeFlags: {} };
+                            const cur = prev[today] || { date: today, priorities: [], tasks: [], credits: {}, postponeFlags: {}, focusedCount: 0, focusedSessions: [] };
                             const nextFlags = { ...(cur.postponeFlags || {}) , [t.id]: flag };
                             return { ...prev, [today]: { ...cur, postponeFlags: nextFlags } };
                           });
@@ -951,6 +1233,129 @@ export default function GoalsApp() {
           </div>
         </CardContent>
       </Card>
+
+      {/* History (Calendar) */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center justify-between">
+            <span className="flex items-center gap-2"><HistoryIcon className="h-5 w-5" /> History</span>
+            <div className="flex items-center gap-2">
+              <Button variant="outline" size="sm" onClick={()=>{
+                const d = new Date(calBase); d.setMonth(d.getMonth()-1); d.setDate(1); setCalBase(d);
+              }}>{'‹'} Prev</Button>
+              <div className="text-sm">{firstOfMonth.toLocaleString(undefined, { month: 'long', year: 'numeric' })}</div>
+              <Button variant="outline" size="sm" onClick={()=>{
+                const d = new Date(calBase); d.setMonth(d.getMonth()+1); d.setDate(1); setCalBase(d);
+              }}>Next {'›'}</Button>
+            </div>
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <div className="grid grid-cols-7 text-xs text-muted-foreground mb-1">
+            {['Mon','Tue','Wed','Thu','Fri','Sat','Sun'].map(d => <div key={d} className="text-center">{d}</div>)}
+          </div>
+          <div className="grid grid-cols-7 gap-2">
+            {monthGrid.map(({ iso, inMonth, avg }) => (
+              <button
+                key={iso}
+                disabled={!inMonth}
+                onClick={() => { setHistDate(iso); setHistOpen(true); }}
+                className={`aspect-square rounded-lg flex items-center justify-center text-sm font-medium
+                  ${inMonth ? colorForAvg(avg) : 'bg-muted text-muted-foreground opacity-50 cursor-default'}
+                  ${inMonth ? 'hover:opacity-90 transition' : ''}
+                `}
+                title={avg === null ? `${iso}: no data` : `${iso}: ${avg}%`}
+              >
+                {new Date(iso).getDate()}
+              </button>
+            ))}
+          </div>
+          <div className="text-xs text-muted-foreground">
+            Legend: <span className="px-2 py-0.5 rounded bg-green-500/80 text-white">>70%</span>{' '}
+            <span className="px-2 py-0.5 rounded bg-yellow-400/80 text-black">51–70%</span>{' '}
+            <span className="px-2 py-0.5 rounded bg-red-500/80 text-white">≤50%</span>{' '}
+            <span className="px-2 py-0.5 rounded bg-muted">no data</span>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Day details modal */}
+      <Dialog open={histOpen} onOpenChange={(v)=> setHistOpen(v)}>
+        <DialogContent className="sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>Day details — {histDate}</DialogTitle>
+          </DialogHeader>
+          {histDate && (() => {
+            const pl = plans[histDate];
+            if (!pl) return <div className="text-xs text-muted-foreground">No plan recorded.</div>;
+            const avg = dayAverageFor(histDate);
+            const grouped = new Map<string, Task[]>();
+            for (const t of pl.tasks) {
+              const arr = grouped.get(t.goalId) || [];
+              arr.push(t);
+              grouped.set(t.goalId, arr);
+            }
+            return (
+              <div className="space-y-4">
+                <div className="p-3 rounded-md border">
+                  <div className="text-sm font-medium">Summary</div>
+                  <div className="text-xs text-muted-foreground">
+                    {avg === null ? 'No tasks logged.' : `Average completion: ${avg}%`}
+                    {' • '}Focused sessions: {pl.focusedCount ?? 0}
+                  </div>
+                </div>
+
+                <div className="space-y-3">
+                  {[...grouped.entries()].map(([gid, list]) => {
+                    const g = goals.find(x=>x.id===gid);
+                    const gAvg = list.length ? Math.round(list.reduce((s,t)=>s+t.percent,0)/list.length) : 0;
+                    return (
+                      <div key={gid} className="p-3 rounded-md border">
+                        <div className="flex items-center justify-between">
+                          <div className="text-sm font-medium">{g?.title ?? 'Unknown goal'}</div>
+                          <div className="text-xs text-muted-foreground">Avg: {gAvg}%</div>
+                        </div>
+                        <div className="mt-2 space-y-1">
+                          {list.map(t => (
+                            <div key={t.id} className="flex items-center justify-between text-sm">
+                              <div className="truncate">{t.title}</div>
+                              <div className="text-xs text-muted-foreground">{t.percent}%</div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })}
+                  {pl.tasks.length === 0 && <div className="text-xs text-muted-foreground">No tasks.</div>}
+                </div>
+
+                <div className="p-3 rounded-md border">
+                  <div className="text-sm font-medium mb-1">Focused sessions</div>
+                  {(pl.focusedSessions?.length ?? 0) === 0 ? (
+                    <div className="text-xs text-muted-foreground">No focused sessions.</div>
+                  ) : (
+                    <div className="space-y-1 max-h-40 overflow-auto">
+                      {(pl.focusedSessions ?? []).map(s => (
+                        <div key={s.id} className="text-xs flex items-center justify-between">
+                          <span>
+                            {new Date(s.startISO).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}
+                            {' → '}
+                            {new Date(s.endISO).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}
+                          </span>
+                          <span>{s.status} • {s.durationMin}m • acks: {s.acknowledgedAt.length}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })()}
+          <DialogFooter>
+            <Button variant="outline" onClick={()=>setHistOpen(false)}>Close</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* dialogs */}
       <GoalModal open={goalOpen} onOpenChange={setGoalOpen} onSave={addGoal}/>
