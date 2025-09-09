@@ -498,7 +498,7 @@ export default function GoalsApp() {
       byGoal.forEach((list, gid) => {
         const g = goals.find((x) => x.id === gid);
         const weight = g?.dailyWeight ?? 5;
-        the const avg = Math.round(list.reduce((s, t) => s + t.percent, 0) / list.length); // 0..100
+        const avg = Math.round(list.reduce((s, t) => s + t.percent, 0) / list.length); // 0..100
         const delta = Math.round((avg / 100) * weight);
         actual += delta;
         max += weight;
