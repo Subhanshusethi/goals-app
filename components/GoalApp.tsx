@@ -87,6 +87,7 @@ const uid = () => Math.random().toString(36).slice(2, 10);
 const clamp = (n: number, min: number, max: number) => Math.min(Math.max(n, min), max);
 const fmtDateLong = () => new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'short', day: 'numeric' });
 const PCT: readonly PercentChoice[] = [0, 5, 20, 50, 100] as const;
+const isTried = (v: TriedOrEmpty): v is Tried => v === 'Yes' || v === 'No' || v === 'Neutral';
 
 /* ========= Seeds / Storage ========= */
 const seedGoals: Goal[] = [
@@ -191,7 +192,7 @@ function CatchUpDialog({
   const hasIncomplete = tasks.some((t) => t.percent < 100);
   const canSubmit = triedWell !== '' && (!hasIncomplete || (why && why.trim().length > 0));
 
-  const triedFinal: Tried = (triedWell === '' ? 'Neutral' : triedWell) as Tried;
+  const triedFinal: Tried = isTried(triedWell) ? triedWell : 'Neutral';
 
   return (
     <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
@@ -402,7 +403,7 @@ export default function GoalsApp() {
     );
 
     // 2) save meta & lock plan
-    const triedFinal: Tried = (tried === '' ? 'Neutral' : tried) as Tried;
+    const triedFinal: Tried = isTried(tried) ? tried : 'Neutral';
     const nextMeta: DayMeta = {
       date: today,
       learned, improve,
@@ -446,7 +447,7 @@ export default function GoalsApp() {
       const projected = clamp(g.progress + delta, 0, 100);
       return { goal: g, avg, delta, projected };
     });
-  }, [priorities, todayByGoal]); // goals dep not needed (priorities contains goal objects)
+  }, [priorities, todayByGoal]);
 
   const streak = useMemo(() => {
     let c = 0;
