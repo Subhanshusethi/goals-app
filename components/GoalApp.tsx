@@ -148,7 +148,7 @@ const loadGoals = () => {
     return sampleGoals;
   }
 };
-const saveGoals = (goals) => localStorage.setItem(LS_KEY, JSON.stringify(goals));
+const saveGoals = (goals: unknown) => localStorage.setItem(LS_KEY, JSON.stringify(goals));
 
 // ---------- Small UI bits ----------
 const SectionTitle = ({ icon: Icon, title, action }) => (
