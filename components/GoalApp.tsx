@@ -78,10 +78,18 @@ const LS_KEY = "goals_v1";
 /** @typedef {{date:string, item:'Goal'|'Milestone', targetId?:string, fromDate?:string, toDate?:string, reason:string}} PostponeEntry */
 /** @typedef {{date:string, what:'Goal'|'Milestone', targetId?:string, reason:string, lesson:string, retryPlan:string}} FailureEntry */
 
-const todayStr = () => new Date().toISOString().slice(0, 10);
-const daysBetween = (a, b) => Math.round((new Date(b) - new Date(a)) / (1000 * 60 * 60 * 24));
-const clamp = (n, min, max) => Math.min(Math.max(n, min), max);
-const uid = () => Math.random().toString(36).slice(2, 10);
+// ---------- Helpers & Types ----------
+const todayStr = (): string =>
+  new Date().toISOString().slice(0, 10);
+
+const daysBetween = (a: string | Date, b: string | Date): number =>
+  Math.round((+new Date(b) - +new Date(a)) / (1000 * 60 * 60 * 24));
+
+const clamp = (n: number, min: number, max: number): number =>
+  Math.min(Math.max(n, min), max);
+
+const uid = (): string => Math.random().toString(36).slice(2, 10);
+
 
 const sampleGoals = /** @type {Goal[]} */ ([
   {
