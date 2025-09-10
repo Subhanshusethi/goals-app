@@ -28,10 +28,14 @@ import {
   History as HistoryIcon,
 } from 'lucide-react';
 
-import { auth, db } from '@/lib/firebase';
+import { requireAuth, requireDb } from '@/lib/firebase';
 import {
   doc, setDoc, getDocs, onSnapshot, collection, query, orderBy, deleteDoc, where,
 } from 'firebase/firestore';
+
+// Initialize Firebase helpers (replace previous direct imports of auth/db)
+const auth = requireAuth();
+const db = requireDb();
 
 /* ========= Types ========= */
 type Priority = 'Low' | 'Medium' | 'High';
@@ -713,7 +717,7 @@ export default function GoalsApp() {
   });
       setGoals(arr);
     });
-    
+
     // Today plan (live)
     const unsubPlan = onSnapshot(doc(db, 'users', u.uid, 'plans', today), (snap) => {
       const data = snap.data() as DayPlan | undefined;
