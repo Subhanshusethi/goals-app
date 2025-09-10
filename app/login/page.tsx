@@ -2,13 +2,17 @@
 
 import React, { useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { signInWithEmailAndPassword, createUserWithEmailAndPassword } from 'firebase/auth';
-import { auth } from '@/lib/firebase';
+import {
+  signInWithEmailAndPassword,
+  createUserWithEmailAndPassword,
+  type Auth,
+} from 'firebase/auth';
 import { FirebaseError } from 'firebase/app';
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
+
 export const dynamic = 'force-dynamic';
 
 export default function LoginPage() {
@@ -23,16 +27,37 @@ export default function LoginPage() {
     e.preventDefault();
     setError('');
     setLoading(true);
+
     try {
-      if (mode === 'signin') {
-        await signInWithEmailAndPassword(auth, email, password);
-      } else {
-        await createUserWithEmailAndPassword(auth, email, password);
+      // Import firebase client module only in the browser at call time.
+      const { auth } = await import('@/lib/firebase');
+      const a = auth; // narrow to a local var so TS can refine the type
+
+      if (!a) {
+        throw new Error('Firebase not initialized. Check your public env vars.');
       }
+
+      if (mode === 'signin') {
+        await signInWithEmailAndPassword(a as Auth, email, password);
+      } else {
+        await createUserWithEmailAndPassword(a as Auth, email, password);
+      }
+
       router.push('/'); // go to app home after auth
     } catch (err) {
       const fe = err as FirebaseError;
-      setError(fe.message || 'Authentication failed');
+      // Friendlier common messages
+      const msg =
+        fe.code === 'auth/invalid-api-key'
+          ? 'Invalid Firebase API key. Verify NEXT_PUBLIC_FIREBASE_* env vars.'
+          : fe.code === 'auth/invalid-credential'
+          ? 'Invalid email or password.'
+          : fe.code === 'auth/user-not-found'
+          ? 'No account found for that email.'
+          : fe.code === 'auth/wrong-password'
+          ? 'Incorrect password.'
+          : fe.message || 'Authentication failed';
+      setError(msg);
     } finally {
       setLoading(false);
     }
@@ -53,8 +78,11 @@ export default function LoginPage() {
                 type="email"
                 autoCapitalize="none"
                 autoCorrect="off"
+                autoComplete="email"
                 value={email}
-                onChange={(e: React.ChangeEvent<HTMLInputElement>) => setEmail(e.target.value)}
+                onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                  setEmail(e.target.value)
+                }
                 required
               />
             </div>
@@ -63,8 +91,11 @@ export default function LoginPage() {
               <Input
                 id="password"
                 type="password"
+                autoComplete="current-password"
                 value={password}
-                onChange={(e: React.ChangeEvent<HTMLInputElement>) => setPassword(e.target.value)}
+                onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                  setPassword(e.target.value)
+                }
                 required
               />
             </div>
@@ -87,4 +118,3 @@ export default function LoginPage() {
     </div>
   );
 }
-
