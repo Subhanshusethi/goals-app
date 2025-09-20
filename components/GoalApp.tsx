@@ -1205,7 +1205,7 @@ export default function GoalsApp() {
       {/* Focused Session */}
       <FocusPanel dateKey={today} plan={planToday} updatePlan={updatePlanToday} />
 
-      {/* End of day — reflect & postpone (auto-saves; tasks auto-carry) */}
+      End of day — reflect & postpone (auto-saves; tasks auto-carry)
       <Card>
         <CardHeader><CardTitle>End of day — reflect & postpone</CardTitle></CardHeader>
         <CardContent className="space-y-4">
@@ -1235,7 +1235,7 @@ export default function GoalsApp() {
               </div>
             </div>
           )}
-
+{/* 
           <div><Label>Why weren’t tasks completed?</Label>
             <Textarea
               rows={2}
@@ -1243,9 +1243,9 @@ export default function GoalsApp() {
               onChange={(e) => setMetaField('whyNotComplete', e.target.value)}
               placeholder="Be specific—what blocked you?"
             />
-          </div>
+          </div> */}
 
-          <div><Label>Did you really try well?</Label>
+          {/* <div><Label>Did you really try well?</Label>
             <div className="flex gap-2 mt-1">
               {(['Yes', 'No', 'Neutral'] as const).map((k) => (
                 <Button
@@ -1258,15 +1258,15 @@ export default function GoalsApp() {
                 </Button>
               ))}
             </div>
-          </div>
+          </div> */}
 
-          <div><Label>How will you improve tomorrow?</Label>
+          {/* <div><Label>How will you improve tomorrow?</Label>
             <Textarea
               rows={2}
               value={metaToday.improve || ''}
               onChange={(e) => setMetaField('improve', e.target.value)}
             />
-          </div>
+          </div> */}
 
           <div><Label>What did you learn today?</Label>
             <Textarea
